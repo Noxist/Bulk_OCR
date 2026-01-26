@@ -1,0 +1,4 @@
+openai>=1.40.0
+ebooklib>=0.18
+PyMuPDF>=1.24.0
+rapidfuzz>=3.9.0
