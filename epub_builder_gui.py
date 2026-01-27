@@ -88,13 +88,17 @@ def get_base_dir() -> Path:
 
 
 def get_app_data_dir() -> Path:
-    if os.name == "nt":
-        root = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
-        if root:
-            return Path(root) / "BulkOCR"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "BulkOCR"
-    return Path.home() / ".local" / "share" / "bulk_ocr"
+    """
+    Returns the directory where data/logs/output should be stored.
+    If running as a frozen EXE, uses the EXE's directory (Portable style).
+    If running as a script, uses the script's directory.
+    """
+    if getattr(sys, "frozen", False):
+        # Running as compiled EXE - store data next to the EXE
+        return Path(sys.executable).parent
+    
+    # Running as Python script
+    return Path(__file__).resolve().parent
 
 
 def default_paths() -> dict:
@@ -124,11 +128,24 @@ def ensure_dirs(settings: AppSettings) -> dict:
         else paths["tocimgs"]
     )
     log_dir = paths["logs"]
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pdfimgs_dir.mkdir(parents=True, exist_ok=True)
-    tocimgs_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Attempt to create directories. If we are in a read-only location (like Program Files)
+    # and not running as admin, this might fail. We wrap it to provide a helpful error 
+    # or fallback could be implemented here (but per request, we keep it 'in location').
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pdfimgs_dir.mkdir(parents=True, exist_ok=True)
+        tocimgs_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        messagebox.showerror(
+            "Permission Error", 
+            f"Could not create folders in {paths['base']}.\n\n"
+            "If you installed to 'Program Files', try running the app as Administrator "
+            "or install to a user folder (e.g. C:\\Users\\Name\\BulkOCR)."
+        )
+
     return {
         "base": paths["base"],
         "input": input_dir,
@@ -179,19 +196,22 @@ def load_settings() -> AppSettings:
 
 def save_settings(settings: AppSettings) -> None:
     path = settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "api_key": settings.api_key,
-        "ocr_prompt_en": settings.ocr_prompt_en,
-        "ocr_prompt_de": settings.ocr_prompt_de,
-        "toc_prompt_en": settings.toc_prompt_en,
-        "toc_prompt_de": settings.toc_prompt_de,
-        "pdf_images_dir": settings.pdf_images_dir,
-        "toc_images_dir": settings.toc_images_dir,
-        "keep_pdf_images": settings.keep_pdf_images,
-        "keep_toc_images": settings.keep_toc_images,
-    }
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "api_key": settings.api_key,
+            "ocr_prompt_en": settings.ocr_prompt_en,
+            "ocr_prompt_de": settings.ocr_prompt_de,
+            "toc_prompt_en": settings.toc_prompt_en,
+            "toc_prompt_de": settings.toc_prompt_de,
+            "pdf_images_dir": settings.pdf_images_dir,
+            "toc_images_dir": settings.toc_images_dir,
+            "keep_pdf_images": settings.keep_pdf_images,
+            "keep_toc_images": settings.keep_toc_images,
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"Failed to save settings: {e}")
 
 
 def timestamp() -> str:
@@ -226,6 +246,8 @@ def encode_image_to_base64(path: Path) -> str:
 
 
 def open_output_folder(path: Path) -> None:
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         os.startfile(path)  # type: ignore[attr-defined]
     elif os.name == "posix":
@@ -233,13 +255,25 @@ def open_output_folder(path: Path) -> None:
 
 
 def find_icon_file() -> Optional[Path]:
-    icon_dir = get_base_dir() / "assets" / "icons"
-    if not icon_dir.exists():
-        return None
-    for name in ("app_icon.ico", "app_icon.png", "app_icon.jpg", "app_icon.jpeg"):
-        path = icon_dir / name
-        if path.exists():
-            return path
+    # Look for icon relative to the executable or script
+    if getattr(sys, "frozen", False):
+         base = Path(sys.executable).parent
+    else:
+         base = get_base_dir()
+         
+    # Check assets/icons in various locations
+    possible_dirs = [
+        base / "assets" / "icons",
+        base / "_internal" / "assets" / "icons", # PyInstaller _internal folder
+    ]
+    
+    for icon_dir in possible_dirs:
+        if not icon_dir.exists():
+            continue
+        for name in ("app_icon.ico", "app_icon.png", "app_icon.jpg", "app_icon.jpeg"):
+            path = icon_dir / name
+            if path.exists():
+                return path
     return None
 
 
