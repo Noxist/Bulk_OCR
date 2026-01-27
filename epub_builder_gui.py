@@ -931,10 +931,10 @@ class EpubBuilderApp:
 
         thumbnail_refs: List[ImageTk.PhotoImage] = []
         vars_by_index: List[IntVar] = []
-        columns = 6
+        columns = 4
         for index in range(page_count):
             page = doc.load_page(index)
-            image = render_pdf_page_thumbnail(page, zoom=0.18)
+            image = render_pdf_page_thumbnail(page, zoom=0.06)
             photo = ImageTk.PhotoImage(image)
             thumbnail_refs.append(photo)
             var = IntVar(value=0)
