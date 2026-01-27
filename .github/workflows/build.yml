@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows Installer
 
 on:
   push:
@@ -8,6 +8,7 @@ on:
       - "epub_builder_gui.py"
       - "build_exe.py"
       - "requirements.txt"
+      - "setup.iss"
       - "assets/**"
   workflow_dispatch:
 
@@ -29,24 +30,37 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup
+
       - name: Resolve version
         id: version
         run: |
-          $version = python -c "import re, pathlib; data = pathlib.Path('epub_builder_gui.py').read_text(encoding='utf-8'); match = re.search(r'APP_VERSION\\s*=\\s*\"([^\"]+)\"', data); print(match.group(1) if match else '0.0.0')"
+          $version = python -c "from build_exe import get_version; print(get_version())"
           echo "value=$version" >> $env:GITHUB_OUTPUT
 
       - name: Build EXE
         run: python build_exe.py
 
-      - name: Upload EXE artifact
+      - name: Prepare for Installer
+        run: |
+          # Rename the versioned EXE to a standard name for the installer script
+          Move-Item -Path "dist\BulkOCR-*.exe" -Destination "dist\BulkOCR.exe"
+
+      - name: Build Installer (Inno Setup)
+        run: |
+          # Run ISCC to compile the setup script, passing the version dynamically
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ steps.version.outputs.value }}" setup.iss
+
+      - name: Upload Installer Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BulkOCR-${{ steps.version.outputs.value }}.exe
-          path: dist/BulkOCR-${{ steps.version.outputs.value }}.exe
+          name: BulkOCR_Setup_v${{ steps.version.outputs.value }}
+          path: Output/BulkOCR_Setup_*.exe
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: v${{ steps.version.outputs.value }}-build.${{ github.run_number }}
-          name: BulkOCR v${{ steps.version.outputs.value }} (build ${{ github.run_number }})
-          files: dist/BulkOCR-${{ steps.version.outputs.value }}.exe
+          files: Output/BulkOCR_Setup_*.exe
