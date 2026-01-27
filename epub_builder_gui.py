@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
-
+import multiprocessing
 import fitz  # PyMuPDF
 from ebooklib import epub
 from openai import OpenAI
@@ -1701,4 +1701,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # <--- Add this line
     main()
