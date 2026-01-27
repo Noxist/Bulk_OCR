@@ -13,8 +13,18 @@ from typing import List, Optional
 import fitz  # PyMuPDF
 from ebooklib import epub
 from openai import OpenAI
+from PIL import Image, ImageTk
 from rapidfuzz import fuzz
-from tkinter import Tk, Toplevel, filedialog, messagebox, StringVar, Menu
+from tkinter import (
+    Canvas,
+    IntVar,
+    Menu,
+    StringVar,
+    Tk,
+    Toplevel,
+    filedialog,
+    messagebox,
+)
 from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
 
@@ -24,26 +34,30 @@ from tkinter import ttk
 OPENAI_API_KEY = "REPLACE_WITH_YOUR_API_KEY"
 OPENAI_MODEL_VISION = "gpt-4o-mini"
 DEFAULT_OCR_PROMPT_EN = (
-    "You are an OCR engine. Extract only the text visible in the image. "
-    "No hallucinations, no headers/footers/page numbers/URLs/ads. "
-    "Fix line-break hyphenations. Return pure running text, preserve original language."
+    "You are an OCR engine for audiobook-friendly text. Extract only the main body text visible in the "
+    "image. Remove citation markers like [12], (Smith, 1999), or ¹, and drop footnote lines entirely. "
+    "Expand abbreviations (e.g. -> for example, Dr. -> Doctor). Ignore running headers, footers, page "
+    "numbers, and marginalia. Fix line-break hyphenations. Keep paragraphs intact; keep list items on "
+    "separate lines. Return pure running text in the original language."
 )
 DEFAULT_OCR_PROMPT_DE = (
-    "Du bist eine OCR-Engine. Extrahiere ausschließlich den Text, der im Bild sichtbar ist. "
-    "Keine Halluzinationen, keine Überschriften/Fußzeilen/Seitenzahlen/URLs/Werbungen. "
-    "Korrigiere Worttrennungen am Zeilenende. Gib reinen Fließtext zurück, Sprache unverändert."
+    "Du bist eine OCR-Engine für hörbuchfreundlichen Text. Extrahiere ausschließlich den Haupttext, "
+    "der im Bild sichtbar ist. Entferne Zitationsmarker wie [12], (Smith, 1999) oder ¹ und lasse "
+    "Fußnotenzeilen komplett weg. Schreibe Abkürzungen aus (z. B. -> zum Beispiel, Dr. -> Doktor). "
+    "Ignoriere Kopf-/Fußzeilen, Seitenzahlen und Randnotizen. Korrigiere Worttrennungen am Zeilenende. "
+    "Erhalte Absätze; Listenpunkte als eigene Zeilen. Gib reinen Fließtext in der Originalsprache zurück."
 )
 DEFAULT_TOC_PROMPT_EN = (
-    "Extract the table of contents from the image(s). "
-    "Return only top-level chapters. Format each line as: TITLE ::: PAGE. "
-    "Keep titles exactly as shown, no subchapters. Support roman and arabic page numbers. "
-    "No extra explanations."
+    "Extract the table of contents from the image(s). Return only top-level entries that have a page "
+    "number. Ignore dotted leader lines (e.g., Chapter 1 ........ 5) and ignore section headers without "
+    "page numbers. Format each line as: TITLE ::: PAGE. Keep titles exactly as shown, no subchapters. "
+    "Support roman and arabic page numbers. No extra explanations."
 )
 DEFAULT_TOC_PROMPT_DE = (
-    "Extrahiere das Inhaltsverzeichnis aus dem/den Bild(ern). "
-    "Gib ausschließlich die Hauptkapitel aus. Format pro Zeile: TITEL ::: SEITE. "
-    "Behalte Titel exakt bei, keine Unterkapitel. Unterstütze römische und arabische Zahlen. "
-    "Keine zusätzlichen Erklärungen."
+    "Extrahiere das Inhaltsverzeichnis aus dem/den Bild(ern). Gib ausschließlich Einträge mit "
+    "Seitenzahl aus. Ignoriere Punktlinien (z. B. Kapitel 1 .... 5) und Abschnittsüberschriften ohne "
+    "Seitenzahl. Format pro Zeile: TITEL ::: SEITE. Behalte Titel exakt bei, keine Unterkapitel. "
+    "Unterstütze römische und arabische Zahlen. Keine zusätzlichen Erklärungen."
 )
 
 
@@ -71,14 +85,17 @@ def ensure_dirs() -> dict:
     input_dir = base / "input"
     output_dir = base / "output"
     pdfimgs_dir = input_dir / "_pdfimgs"
+    tocimgs_dir = input_dir / "_tocimgs"
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     pdfimgs_dir.mkdir(parents=True, exist_ok=True)
+    tocimgs_dir.mkdir(parents=True, exist_ok=True)
     return {
         "base": base,
         "input": input_dir,
         "output": output_dir,
         "pdfimgs": pdfimgs_dir,
+        "tocimgs": tocimgs_dir,
     }
 
 
@@ -293,6 +310,38 @@ def extract_pdf_images(pdf_path: Path, output_dir: Path, log_fn=None) -> List[Pa
     return image_paths
 
 
+def render_pdf_page_thumbnail(page: fitz.Page, zoom: float = 0.3) -> Image.Image:
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+
+def render_pdf_pages_to_images(
+    pdf_path: Path,
+    page_indices: List[int],
+    output_dir: Path,
+    zoom: float = 3.0,
+    prefix: str = "toc_page",
+    log_fn=None,
+) -> List[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for item in output_dir.glob(f"{prefix}_*.png"):
+        item.unlink()
+    doc = fitz.open(pdf_path)
+    image_paths: List[Path] = []
+    mat = fitz.Matrix(zoom, zoom)
+    for page_index in page_indices:
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_path = output_dir / f"{prefix}_{page_index + 1:04d}.png"
+        pix.save(img_path.as_posix())
+        image_paths.append(img_path)
+        if log_fn:
+            log_fn(f"Rendered TOC image: {img_path.name}")
+    doc.close()
+    return image_paths
+
+
 def split_into_paragraphs(text: str) -> List[str]:
     lines = [line.strip() for line in text.splitlines()]
     paragraphs: List[str] = []
@@ -411,6 +460,8 @@ class EpubBuilderApp:
         self.toc_paths: List[Path] = []
 
         self._build_ui()
+        if not self.settings.api_key or self.settings.api_key == "REPLACE_WITH_YOUR_API_KEY":
+            self.root.after(200, self.open_settings_dialog)
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -446,12 +497,8 @@ class EpubBuilderApp:
         ttk.Button(frame, text="Select text file", command=self.select_txt).grid(
             row=3, column=1, sticky="ew", pady=4
         )
-        ttk.Button(frame, text="Select TOC images", command=self.select_toc).grid(
-            row=4, column=0, sticky="ew", pady=4
-        )
-
         ttk.Button(frame, text="Start", command=self.start).grid(
-            row=4, column=1, sticky="ew", pady=4
+            row=4, column=0, columnspan=2, sticky="ew", pady=4
         )
 
         ttk.Button(frame, text="Clear log", command=self.clear_log).grid(
@@ -555,6 +602,7 @@ class EpubBuilderApp:
         if path:
             self.pdf_path = Path(path)
             self._log(f"Selected PDF: {self.pdf_path.name}")
+            self._select_toc_pages_from_pdf()
 
     def select_txt(self) -> None:
         path = filedialog.askopenfilename(
@@ -565,14 +613,103 @@ class EpubBuilderApp:
             self.txt_path = Path(path)
             self._log(f"Selected text file: {self.txt_path.name}")
 
-    def select_toc(self) -> None:
-        paths = filedialog.askopenfilenames(
-            title="Select TOC images",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp")],
+    def _select_toc_pages_from_pdf(self) -> None:
+        if not self.pdf_path:
+            return
+        try:
+            doc = fitz.open(self.pdf_path)
+        except Exception as exc:
+            messagebox.showerror("PDF Error", f"Could not open PDF: {exc}")
+            return
+        page_count = min(20, doc.page_count)
+        if page_count == 0:
+            doc.close()
+            messagebox.showerror("PDF Error", "PDF has no pages.")
+            return
+        selected_indices = self._open_toc_selector_dialog(doc, page_count)
+        doc.close()
+        if not selected_indices:
+            self._log("No TOC pages selected.")
+            self.toc_paths = []
+            return
+        self.toc_paths = render_pdf_pages_to_images(
+            self.pdf_path,
+            selected_indices,
+            self.paths["tocimgs"],
+            zoom=3.0,
+            log_fn=self._log,
         )
-        if paths:
-            self.toc_paths = [Path(p) for p in paths]
-            self._log(f"Selected {len(self.toc_paths)} TOC image(s)")
+        self._log(f"Selected {len(self.toc_paths)} TOC page(s)")
+
+    def _open_toc_selector_dialog(
+        self, doc: fitz.Document, page_count: int
+    ) -> List[int]:
+        dialog = Toplevel(self.root)
+        dialog.title("Select TOC Pages")
+        dialog.geometry("800x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text="Select the pages that contain the Table of Contents.",
+            padding=8,
+        ).pack(anchor="w")
+
+        canvas = Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_configure(event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", on_configure)
+
+        thumbnail_refs: List[ImageTk.PhotoImage] = []
+        vars_by_index: List[IntVar] = []
+        columns = 4
+        for index in range(page_count):
+            page = doc.load_page(index)
+            image = render_pdf_page_thumbnail(page, zoom=0.3)
+            photo = ImageTk.PhotoImage(image)
+            thumbnail_refs.append(photo)
+            var = IntVar(value=0)
+            vars_by_index.append(var)
+
+            frame = ttk.Frame(inner, padding=4, relief="solid")
+            frame.grid(row=index // columns, column=index % columns, padx=6, pady=6)
+            ttk.Label(frame, image=photo).pack()
+            ttk.Checkbutton(frame, text=f"Page {index + 1}", variable=var).pack()
+
+        selected_indices: List[int] = []
+
+        def confirm() -> None:
+            selection = [idx for idx, var in enumerate(vars_by_index) if var.get() == 1]
+            if not selection:
+                messagebox.showwarning(
+                    "No selection", "Please select at least one TOC page."
+                )
+                return
+            selected_indices.extend(selection)
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        button_frame = ttk.Frame(dialog, padding=8)
+        button_frame.pack(side="bottom", fill="x")
+        ttk.Button(button_frame, text="Confirm selection", command=confirm).pack(
+            side="right", padx=6
+        )
+        ttk.Button(button_frame, text="Cancel", command=cancel).pack(side="right")
+
+        dialog.wait_window()
+        return selected_indices
 
     def start(self) -> None:
         thread = threading.Thread(target=self._run_pipeline, daemon=True)
