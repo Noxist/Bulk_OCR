@@ -35,7 +35,7 @@ from tkinter import ttk
 # ============================================================
 # OpenAI API KEY (replace this with your own key)
 # ============================================================
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 OPENAI_API_KEY = "REPLACE_WITH_YOUR_API_KEY"
 OPENAI_MODEL_VISION = "gpt-4o-mini"
 BATCH_MAX_FILE_BYTES = 140 * 1024 * 1024
@@ -74,6 +74,7 @@ class AppSettings:
     ocr_prompt_de: str
     toc_prompt_en: str
     toc_prompt_de: str
+    output_dir: str
     pdf_images_dir: str
     toc_images_dir: str
     keep_pdf_images: bool
@@ -130,7 +131,7 @@ def default_paths() -> dict:
 def ensure_dirs(settings: AppSettings) -> dict:
     paths = default_paths()
     input_dir = paths["input"]
-    output_dir = paths["output"]
+    output_dir = Path(settings.output_dir) if settings.output_dir else paths["output"]
     pdfimgs_dir = (
         Path(settings.pdf_images_dir)
         if settings.pdf_images_dir
@@ -230,6 +231,7 @@ def load_settings() -> AppSettings:
         ocr_prompt_de=DEFAULT_OCR_PROMPT_DE,
         toc_prompt_en=DEFAULT_TOC_PROMPT_EN,
         toc_prompt_de=DEFAULT_TOC_PROMPT_DE,
+        output_dir=str(default_dirs["output"]),
         pdf_images_dir=str(default_dirs["pdfimgs"]),
         toc_images_dir=str(default_dirs["tocimgs"]),
         keep_pdf_images=False,
@@ -248,6 +250,7 @@ def load_settings() -> AppSettings:
         ocr_prompt_de=data.get("ocr_prompt_de", defaults.ocr_prompt_de),
         toc_prompt_en=data.get("toc_prompt_en", defaults.toc_prompt_en),
         toc_prompt_de=data.get("toc_prompt_de", defaults.toc_prompt_de),
+        output_dir=data.get("output_dir", defaults.output_dir),
         pdf_images_dir=data.get("pdf_images_dir", defaults.pdf_images_dir),
         toc_images_dir=data.get("toc_images_dir", defaults.toc_images_dir),
         keep_pdf_images=data.get("keep_pdf_images", defaults.keep_pdf_images),
@@ -265,6 +268,7 @@ def save_settings(settings: AppSettings) -> None:
             "ocr_prompt_de": settings.ocr_prompt_de,
             "toc_prompt_en": settings.toc_prompt_en,
             "toc_prompt_de": settings.toc_prompt_de,
+            "output_dir": settings.output_dir,
             "pdf_images_dir": settings.pdf_images_dir,
             "toc_images_dir": settings.toc_images_dir,
             "keep_pdf_images": settings.keep_pdf_images,
@@ -304,6 +308,18 @@ def normalize_text(text: str) -> str:
 def encode_image_to_base64(path: Path) -> str:
     with path.open("rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
+
+def collect_image_files(folder: Path) -> List[Path]:
+    allowed = {".png", ".jpg", ".jpeg"}
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in allowed
+        ],
+        key=lambda item: item.name.casefold(),
+    )
 
 
 def open_output_folder(path: Path) -> None:
@@ -756,10 +772,14 @@ class EpubBuilderApp:
         self.root.title(f"Assistive OCR EPUB Builder v{APP_VERSION}")
 
         self.mode_var = StringVar(value="pdf")
+        self.skip_toc_var = BooleanVar(value=False)
+        self.stack_images_var = BooleanVar(value=True)
+        self.stack_batch_size_var = IntVar(value=4)
         self.pdf_path: Optional[Path] = None
         self.txt_path: Optional[Path] = None
         self.batch_result_paths: List[Path] = []
         self.toc_paths: List[Path] = []
+        self.image_folder: Optional[Path] = None
         self.pause_event = threading.Event()
         self.is_running = False
         self.progress_var = IntVar(value=0)
@@ -829,9 +849,22 @@ class EpubBuilderApp:
             variable=self.mode_var,
             value="batch",
         )
+        mode_images = ttk.Radiobutton(
+            mode_frame,
+            text="Mode D: Image folder → OCR → EPUB",
+            variable=self.mode_var,
+            value="images",
+        )
         mode_pdf.grid(row=0, column=0, columnspan=2, sticky="w")
         mode_txt.grid(row=1, column=0, columnspan=2, sticky="w")
         mode_batch.grid(row=2, column=0, columnspan=2, sticky="w")
+        mode_images.grid(row=3, column=0, columnspan=2, sticky="w")
+
+        ttk.Checkbutton(
+            mode_frame,
+            text="Skip TOC (single chapter)",
+            variable=self.skip_toc_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         action_frame = ttk.Labelframe(frame, text="Source Files", padding=8)
         action_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -854,17 +887,41 @@ class EpubBuilderApp:
             text="Select batch result JSONL",
             command=self.select_batch_results,
         ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(
+            action_frame,
+            text="Select image folder",
+            command=self.select_image_folder,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=4)
+
+        options_frame = ttk.Labelframe(frame, text="Image OCR Options", padding=8)
+        options_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        options_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            options_frame,
+            text="Stack multiple images per request",
+            variable=self.stack_images_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(options_frame, text="Max images per request").grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Spinbox(
+            options_frame,
+            from_=1,
+            to=20,
+            textvariable=self.stack_batch_size_var,
+            width=6,
+        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
 
         ttk.Button(frame, text="Start", command=self.start).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+            row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
         self.pause_button = ttk.Button(
             frame, text="Pause", command=self.toggle_pause, state="disabled"
         )
-        self.pause_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.pause_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
         progress_frame = ttk.Frame(frame)
-        progress_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        progress_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         progress_frame.columnconfigure(0, weight=1)
         progress_label = ttk.Label(progress_frame, textvariable=self.progress_label_var)
         progress_label.grid(row=0, column=0, sticky="w")
@@ -874,11 +931,11 @@ class EpubBuilderApp:
         self.progress_bar.grid(row=1, column=0, sticky="ew")
 
         log_frame = ttk.Labelframe(frame, text="Logs", padding=8)
-        log_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        log_frame.grid(row=6, column=0, columnspan=2, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.columnconfigure(1, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        frame.rowconfigure(5, weight=1)
+        frame.rowconfigure(6, weight=1)
 
         self.log = ScrolledText(log_frame, height=18)
         self.log.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
@@ -903,7 +960,7 @@ class EpubBuilderApp:
         version_label = ttk.Label(
             frame, text=f"Version {APP_VERSION}", foreground="#666666"
         )
-        version_label.grid(row=6, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        version_label.grid(row=7, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
         self._log(f"Input folder: {self.paths['input']}")
         self._log(f"Output folder: {self.paths['output']}")
@@ -955,9 +1012,27 @@ class EpubBuilderApp:
         toc_de.grid(row=9, column=0, sticky="ew", pady=(0, 10))
         toc_de.insert("1.0", self.settings.toc_prompt_de)
 
-        ttk.Label(frame, text="PDF image folder").grid(row=10, column=0, sticky="w")
+        ttk.Label(frame, text="Output folder").grid(row=10, column=0, sticky="w")
+        output_dir_frame = ttk.Frame(frame)
+        output_dir_frame.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+        output_dir_frame.columnconfigure(0, weight=1)
+        output_dir_entry = ttk.Entry(output_dir_frame, width=60)
+        output_dir_entry.grid(row=0, column=0, sticky="ew")
+        output_dir_entry.insert(0, self.settings.output_dir)
+
+        def choose_output_dir() -> None:
+            path = filedialog.askdirectory(title="Select output folder")
+            if path:
+                output_dir_entry.delete(0, "end")
+                output_dir_entry.insert(0, path)
+
+        ttk.Button(output_dir_frame, text="Browse", command=choose_output_dir).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+
+        ttk.Label(frame, text="PDF image folder").grid(row=12, column=0, sticky="w")
         pdf_dir_frame = ttk.Frame(frame)
-        pdf_dir_frame.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+        pdf_dir_frame.grid(row=13, column=0, sticky="ew", pady=(0, 10))
         pdf_dir_frame.columnconfigure(0, weight=1)
         pdf_dir_entry = ttk.Entry(pdf_dir_frame, width=60)
         pdf_dir_entry.grid(row=0, column=0, sticky="ew")
@@ -973,9 +1048,9 @@ class EpubBuilderApp:
             row=0, column=1, padx=(6, 0)
         )
 
-        ttk.Label(frame, text="TOC image folder").grid(row=12, column=0, sticky="w")
+        ttk.Label(frame, text="TOC image folder").grid(row=14, column=0, sticky="w")
         toc_dir_frame = ttk.Frame(frame)
-        toc_dir_frame.grid(row=13, column=0, sticky="ew", pady=(0, 10))
+        toc_dir_frame.grid(row=15, column=0, sticky="ew", pady=(0, 10))
         toc_dir_frame.columnconfigure(0, weight=1)
         toc_dir_entry = ttk.Entry(toc_dir_frame, width=60)
         toc_dir_entry.grid(row=0, column=0, sticky="ew")
@@ -997,15 +1072,15 @@ class EpubBuilderApp:
             frame,
             text="Keep PDF images after OCR",
             variable=keep_pdf_var,
-        ).grid(row=14, column=0, sticky="w")
+        ).grid(row=16, column=0, sticky="w")
         ttk.Checkbutton(
             frame,
             text="Keep TOC images after OCR",
             variable=keep_toc_var,
-        ).grid(row=15, column=0, sticky="w")
+        ).grid(row=17, column=0, sticky="w")
 
         button_frame = ttk.Frame(frame)
-        button_frame.grid(row=16, column=0, sticky="e", pady=(10, 0))
+        button_frame.grid(row=18, column=0, sticky="e", pady=(10, 0))
 
         def save_and_close() -> None:
             self.settings = AppSettings(
@@ -1014,6 +1089,7 @@ class EpubBuilderApp:
                 ocr_prompt_de=ocr_de.get("1.0", "end").strip(),
                 toc_prompt_en=toc_en.get("1.0", "end").strip(),
                 toc_prompt_de=toc_de.get("1.0", "end").strip(),
+                output_dir=output_dir_entry.get().strip(),
                 pdf_images_dir=pdf_dir_entry.get().strip(),
                 toc_images_dir=toc_dir_entry.get().strip(),
                 keep_pdf_images=keep_pdf_var.get(),
@@ -1133,7 +1209,10 @@ class EpubBuilderApp:
         if path:
             self.pdf_path = Path(path)
             self._log(f"Selected PDF: {self.pdf_path.name}")
-            self._select_toc_pages_from_pdf()
+            if self.skip_toc_var.get():
+                self._log("Skip TOC enabled. Not selecting TOC pages.")
+            else:
+                self._select_toc_pages_from_pdf()
 
     def select_txt(self) -> None:
         path = filedialog.askopenfilename(
@@ -1153,6 +1232,21 @@ class EpubBuilderApp:
             self.batch_result_paths = [Path(path) for path in paths]
             names = ", ".join(path.name for path in self.batch_result_paths)
             self._log(f"Selected batch result files: {names}")
+
+    def select_image_folder(self) -> None:
+        path = filedialog.askdirectory(title="Select image folder")
+        if path:
+            folder = Path(path)
+            self.image_folder = folder
+            images = collect_image_files(folder)
+            if not images:
+                messagebox.showwarning(
+                    "No images",
+                    "No PNG/JPEG images found in the selected folder.",
+                )
+            self._log(
+                f"Selected image folder: {folder} ({len(images)} image(s) found)"
+            )
 
     def create_batch_jsonl(self) -> None:
         if not self.pdf_path:
@@ -1350,10 +1444,8 @@ class EpubBuilderApp:
         try:
             client = build_openai_client(self.settings.api_key)
             mode = self.mode_var.get()
+            skip_toc = self.skip_toc_var.get()
             if mode == "batch":
-                if not self.pdf_path:
-                    messagebox.showerror("Missing PDF", "Please select a PDF file.")
-                    return
                 if not self.batch_result_paths:
                     messagebox.showerror(
                         "Missing batch result",
@@ -1361,22 +1453,32 @@ class EpubBuilderApp:
                     )
                     return
                 text, language = self._process_batch_results()
-                self._select_toc_pages_from_pdf()
-                if not self.toc_paths:
-                    messagebox.showerror(
-                        "Missing TOC", "Please select TOC images."
-                    )
-                    return
+                if not skip_toc:
+                    if not self.toc_paths:
+                        if not self.pdf_path:
+                            messagebox.showerror(
+                                "Missing PDF",
+                                "Please select a PDF file to extract TOC images.",
+                            )
+                            return
+                        self._select_toc_pages_from_pdf()
+                    if not self.toc_paths:
+                        messagebox.showerror(
+                            "Missing TOC", "Please select TOC images."
+                        )
+                        return
             elif mode == "pdf":
-                if not self.toc_paths:
-                    messagebox.showerror("Missing TOC", "Please select TOC images.")
-                    return
                 if not self.pdf_path:
                     messagebox.showerror("Missing PDF", "Please select a PDF file.")
                     return
+                if not skip_toc and not self.toc_paths:
+                    self._select_toc_pages_from_pdf()
+                if not skip_toc and not self.toc_paths:
+                    messagebox.showerror("Missing TOC", "Please select TOC images.")
+                    return
                 text, language = self._process_pdf(client)
-            else:
-                if not self.toc_paths:
+            elif mode == "text":
+                if not skip_toc and not self.toc_paths:
                     messagebox.showerror("Missing TOC", "Please select TOC images.")
                     return
                 if not self.txt_path:
@@ -1385,33 +1487,50 @@ class EpubBuilderApp:
                 text = self.txt_path.read_text(encoding="utf-8", errors="ignore")
                 language = detect_language(text)
                 self._log(f"Detected language: {language}")
-
-            toc_entries = ocr_toc(
-                client,
-                self.toc_paths,
-                language,
-                prompt_override=self._toc_prompt_for_language(language),
-                log_fn=self._log,
-            )
-            if not self.settings.keep_toc_images:
-                for image_path in self.toc_paths:
-                    try:
-                        image_path.unlink()
-                    except Exception:
-                        continue
-            if not toc_entries:
-                messagebox.showerror("TOC OCR failed", "No TOC entries detected.")
+            elif mode == "images":
+                if not self.image_folder:
+                    messagebox.showerror(
+                        "Missing images", "Please select an image folder."
+                    )
+                    return
+                if not skip_toc and not self.toc_paths:
+                    messagebox.showerror("Missing TOC", "Please select TOC images.")
+                    return
+                text, language = self._process_image_folder(client)
+            else:
+                messagebox.showerror("Invalid mode", "Please select a valid mode.")
                 return
-            self._log(f"Detected {len(toc_entries)} TOC entries")
 
-            chapters = build_chapters_from_toc(
-                text, toc_entries, threshold=83, log_fn=self._log
-            )
-            if not chapters:
-                messagebox.showerror(
-                    "Chapter detection failed", "No chapters could be matched."
+            if skip_toc:
+                self._log("Skipping TOC. Creating a single-chapter EPUB.")
+                chapters = [{"title": "Full Text", "text": text}]
+            else:
+                toc_entries = ocr_toc(
+                    client,
+                    self.toc_paths,
+                    language,
+                    prompt_override=self._toc_prompt_for_language(language),
+                    log_fn=self._log,
                 )
-                return
+                if not self.settings.keep_toc_images:
+                    for image_path in self.toc_paths:
+                        try:
+                            image_path.unlink()
+                        except Exception:
+                            continue
+                if not toc_entries:
+                    messagebox.showerror("TOC OCR failed", "No TOC entries detected.")
+                    return
+                self._log(f"Detected {len(toc_entries)} TOC entries")
+
+                chapters = build_chapters_from_toc(
+                    text, toc_entries, threshold=83, log_fn=self._log
+                )
+                if not chapters:
+                    messagebox.showerror(
+                        "Chapter detection failed", "No chapters could be matched."
+                    )
+                    return
 
             output_name = f"epub_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.epub"
             output_path = self.paths["output"] / output_name
@@ -1515,6 +1634,52 @@ class EpubBuilderApp:
                     image_path.unlink()
                 except Exception:
                     continue
+        return full_text, language
+
+    def _process_image_folder(self, client: OpenAI) -> tuple[str, str]:
+        if not self.image_folder:
+            raise ValueError("No image folder selected.")
+        images = collect_image_files(self.image_folder)
+        if not images:
+            raise ValueError("No PNG/JPEG images found in the selected folder.")
+        self._log("Running quick OCR for language detection")
+        sample_text = ocr_pages(
+            client,
+            [images[0]],
+            "english",
+            prompt_override=self._ocr_prompt_for_language("english"),
+            log_fn=self._log,
+        )
+        language = detect_language(sample_text)
+        self._log(f"Detected language: {language}")
+
+        prompt = self._ocr_prompt_for_language(language)
+        stack_images = self.stack_images_var.get()
+        batch_size = self.stack_batch_size_var.get()
+        if not stack_images or batch_size < 1:
+            batch_size = 1
+        total = len(images)
+        batches = chunk_list(images, batch_size)
+        text_chunks: List[str] = []
+        self._log(
+            f"Starting OCR on {total} images (batch size: {batch_size})"
+        )
+        processed = 0
+        for idx, batch in enumerate(batches, start=1):
+            self._wait_if_paused()
+            self._log(f"OCR batch {idx}/{len(batches)}")
+            batch_text = ocr_images_with_retry(
+                client,
+                batch,
+                prompt,
+                max_batch_size=batch_size,
+                log_fn=self._log,
+            )
+            text_chunks.append(batch_text.strip())
+            processed += len(batch)
+            self._write_progress_text(text_chunks)
+            self._update_progress(processed, total)
+        full_text = "\n".join(text_chunks).strip()
         return full_text, language
 
     def _process_batch_results(self) -> tuple[str, str]:
