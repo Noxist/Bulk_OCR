@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -16,6 +17,7 @@ from openai import OpenAI
 from PIL import Image, ImageTk
 from rapidfuzz import fuzz
 from tkinter import (
+    BooleanVar,
     Canvas,
     IntVar,
     Menu,
@@ -31,6 +33,7 @@ from tkinter import ttk
 # ============================================================
 # OpenAI API KEY (replace this with your own key)
 # ============================================================
+APP_VERSION = "0.2.0"
 OPENAI_API_KEY = "REPLACE_WITH_YOUR_API_KEY"
 OPENAI_MODEL_VISION = "gpt-4o-mini"
 DEFAULT_OCR_PROMPT_EN = (
@@ -68,6 +71,10 @@ class AppSettings:
     ocr_prompt_de: str
     toc_prompt_en: str
     toc_prompt_de: str
+    pdf_images_dir: str
+    toc_images_dir: str
+    keep_pdf_images: bool
+    keep_toc_images: bool
 
 
 @dataclass
@@ -80,37 +87,75 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def ensure_dirs() -> dict:
-    base = get_base_dir()
-    input_dir = base / "input"
-    output_dir = base / "output"
-    pdfimgs_dir = input_dir / "_pdfimgs"
-    tocimgs_dir = input_dir / "_tocimgs"
+def get_app_data_dir() -> Path:
+    if os.name == "nt":
+        root = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root) / "BulkOCR"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "BulkOCR"
+    return Path.home() / ".local" / "share" / "bulk_ocr"
+
+
+def default_paths() -> dict:
+    base = get_app_data_dir()
+    return {
+        "base": base,
+        "input": base / "input",
+        "output": base / "output",
+        "pdfimgs": base / "input" / "_pdfimgs",
+        "tocimgs": base / "input" / "_tocimgs",
+        "logs": base / "logs",
+    }
+
+
+def ensure_dirs(settings: AppSettings) -> dict:
+    paths = default_paths()
+    input_dir = paths["input"]
+    output_dir = paths["output"]
+    pdfimgs_dir = (
+        Path(settings.pdf_images_dir)
+        if settings.pdf_images_dir
+        else paths["pdfimgs"]
+    )
+    tocimgs_dir = (
+        Path(settings.toc_images_dir)
+        if settings.toc_images_dir
+        else paths["tocimgs"]
+    )
+    log_dir = paths["logs"]
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     pdfimgs_dir.mkdir(parents=True, exist_ok=True)
     tocimgs_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "base": base,
+        "base": paths["base"],
         "input": input_dir,
         "output": output_dir,
         "pdfimgs": pdfimgs_dir,
         "tocimgs": tocimgs_dir,
+        "logs": log_dir,
     }
 
 
 def settings_path() -> Path:
-    return get_base_dir() / "settings.json"
+    return get_app_data_dir() / "settings.json"
 
 
 def load_settings() -> AppSettings:
     default_api_key = os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)
+    default_dirs = default_paths()
     defaults = AppSettings(
         api_key=default_api_key,
         ocr_prompt_en=DEFAULT_OCR_PROMPT_EN,
         ocr_prompt_de=DEFAULT_OCR_PROMPT_DE,
         toc_prompt_en=DEFAULT_TOC_PROMPT_EN,
         toc_prompt_de=DEFAULT_TOC_PROMPT_DE,
+        pdf_images_dir=str(default_dirs["pdfimgs"]),
+        toc_images_dir=str(default_dirs["tocimgs"]),
+        keep_pdf_images=False,
+        keep_toc_images=True,
     )
     path = settings_path()
     if not path.exists():
@@ -125,17 +170,26 @@ def load_settings() -> AppSettings:
         ocr_prompt_de=data.get("ocr_prompt_de", defaults.ocr_prompt_de),
         toc_prompt_en=data.get("toc_prompt_en", defaults.toc_prompt_en),
         toc_prompt_de=data.get("toc_prompt_de", defaults.toc_prompt_de),
+        pdf_images_dir=data.get("pdf_images_dir", defaults.pdf_images_dir),
+        toc_images_dir=data.get("toc_images_dir", defaults.toc_images_dir),
+        keep_pdf_images=data.get("keep_pdf_images", defaults.keep_pdf_images),
+        keep_toc_images=data.get("keep_toc_images", defaults.keep_toc_images),
     )
 
 
 def save_settings(settings: AppSettings) -> None:
     path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "api_key": settings.api_key,
         "ocr_prompt_en": settings.ocr_prompt_en,
         "ocr_prompt_de": settings.ocr_prompt_de,
         "toc_prompt_en": settings.toc_prompt_en,
         "toc_prompt_de": settings.toc_prompt_de,
+        "pdf_images_dir": settings.pdf_images_dir,
+        "toc_images_dir": settings.toc_images_dir,
+        "keep_pdf_images": settings.keep_pdf_images,
+        "keep_toc_images": settings.keep_toc_images,
     }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -176,6 +230,17 @@ def open_output_folder(path: Path) -> None:
         os.startfile(path)  # type: ignore[attr-defined]
     elif os.name == "posix":
         os.system(f'xdg-open "{path}"')
+
+
+def find_icon_file() -> Optional[Path]:
+    icon_dir = get_base_dir() / "assets" / "icons"
+    if not icon_dir.exists():
+        return None
+    for name in ("app_icon.ico", "app_icon.png", "app_icon.jpg", "app_icon.jpeg"):
+        path = icon_dir / name
+        if path.exists():
+            return path
+    return None
 
 
 def build_openai_client(api_key: str) -> OpenAI:
@@ -291,13 +356,18 @@ def ocr_toc(
     return entries
 
 
-def extract_pdf_images(pdf_path: Path, output_dir: Path, log_fn=None) -> List[Path]:
+def extract_pdf_images(
+    pdf_path: Path, output_dir: Path, cleanup: bool, log_fn=None
+) -> List[Path]:
     if log_fn:
         log_fn(f"Rendering PDF pages to images: {pdf_path.name}")
     doc = fitz.open(pdf_path)
     image_paths: List[Path] = []
     zoom = 2
     mat = fitz.Matrix(zoom, zoom)
+    if cleanup:
+        for item in output_dir.glob("*.png"):
+            item.unlink()
     for page_index in range(doc.page_count):
         page = doc.load_page(page_index)
         pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -322,11 +392,13 @@ def render_pdf_pages_to_images(
     output_dir: Path,
     zoom: float = 3.0,
     prefix: str = "toc_page",
+    cleanup: bool = True,
     log_fn=None,
 ) -> List[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    for item in output_dir.glob(f"{prefix}_*.png"):
-        item.unlink()
+    if cleanup:
+        for item in output_dir.glob(f"{prefix}_*.png"):
+            item.unlink()
     doc = fitz.open(pdf_path)
     image_paths: List[Path] = []
     mat = fitz.Matrix(zoom, zoom)
@@ -450,9 +522,14 @@ def create_epub(
 class EpubBuilderApp:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("Assistive OCR EPUB Builder")
-        self.paths = ensure_dirs()
         self.settings = load_settings()
+        self.paths = ensure_dirs(self.settings)
+        self.log_file = self.paths["logs"] / "bulk_ocr.log"
+        self._icon_photo: Optional[ImageTk.PhotoImage] = None
+
+        self._configure_style()
+        self._set_app_icon()
+        self.root.title(f"Assistive OCR EPUB Builder v{APP_VERSION}")
 
         self.mode_var = StringVar(value="pdf")
         self.pdf_path: Optional[Path] = None
@@ -463,9 +540,35 @@ class EpubBuilderApp:
         if not self.settings.api_key or self.settings.api_key == "REPLACE_WITH_YOUR_API_KEY":
             self.root.after(200, self.open_settings_dialog)
 
+    def _configure_style(self) -> None:
+        self.root.option_add("*Font", "Segoe UI 10")
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TButton", padding=6)
+        style.configure("TLabel", padding=2)
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        self.root.configure(background="#f4f4f6")
+
+    def _set_app_icon(self) -> None:
+        icon_path = find_icon_file()
+        if not icon_path:
+            return
+        try:
+            if icon_path.suffix.lower() == ".ico" and os.name == "nt":
+                self.root.iconbitmap(icon_path.as_posix())
+                return
+            image = Image.open(icon_path)
+            self._icon_photo = ImageTk.PhotoImage(image)
+            self.root.iconphoto(True, self._icon_photo)
+        except Exception:
+            return
+
     def _build_ui(self) -> None:
         self._build_menu()
-        frame = ttk.Frame(self.root, padding=10)
+        frame = ttk.Frame(self.root, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
 
         self.root.columnconfigure(0, weight=1)
@@ -473,53 +576,85 @@ class EpubBuilderApp:
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
-        mode_label = ttk.Label(frame, text="Mode")
-        mode_label.grid(row=0, column=0, sticky="w")
+        mode_frame = ttk.Labelframe(frame, text="Input Mode", padding=8)
+        mode_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        mode_frame.columnconfigure(0, weight=1)
+        mode_frame.columnconfigure(1, weight=1)
 
         mode_pdf = ttk.Radiobutton(
-            frame,
+            mode_frame,
             text="Mode A: PDF + TOC images → OCR → EPUB",
             variable=self.mode_var,
             value="pdf",
         )
         mode_txt = ttk.Radiobutton(
-            frame,
+            mode_frame,
             text="Mode B: Textfile + TOC images → EPUB",
             variable=self.mode_var,
             value="text",
         )
-        mode_pdf.grid(row=1, column=0, columnspan=2, sticky="w")
-        mode_txt.grid(row=2, column=0, columnspan=2, sticky="w")
+        mode_pdf.grid(row=0, column=0, columnspan=2, sticky="w")
+        mode_txt.grid(row=1, column=0, columnspan=2, sticky="w")
 
-        ttk.Button(frame, text="Select PDF", command=self.select_pdf).grid(
-            row=3, column=0, sticky="ew", pady=4
+        action_frame = ttk.Labelframe(frame, text="Source Files", padding=8)
+        action_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        action_frame.columnconfigure(0, weight=1)
+        action_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(action_frame, text="Select PDF", command=self.select_pdf).grid(
+            row=0, column=0, sticky="ew", pady=4, padx=(0, 6)
         )
-        ttk.Button(frame, text="Select text file", command=self.select_txt).grid(
-            row=3, column=1, sticky="ew", pady=4
+        ttk.Button(action_frame, text="Select text file", command=self.select_txt).grid(
+            row=0, column=1, sticky="ew", pady=4, padx=(6, 0)
         )
+
         ttk.Button(frame, text="Start", command=self.start).grid(
-            row=4, column=0, columnspan=2, sticky="ew", pady=4
+            row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
 
-        ttk.Button(frame, text="Clear log", command=self.clear_log).grid(
-            row=5, column=0, sticky="ew", pady=4
+        log_frame = ttk.Labelframe(frame, text="Logs", padding=8)
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.columnconfigure(1, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+        self.log = ScrolledText(log_frame, height=18)
+        self.log.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        self.log.configure(font=("Consolas", 10))
+
+        ttk.Button(log_frame, text="Clear log", command=self.clear_log).grid(
+            row=1, column=0, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(frame, text="Open output folder", command=self.open_output).grid(
-            row=5, column=1, sticky="ew", pady=4
+        ttk.Button(log_frame, text="Open output folder", command=self.open_output).grid(
+            row=1, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(log_frame, text="Export log", command=self.export_log).grid(
+            row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 6)
+        )
+        ttk.Button(log_frame, text="Open log file", command=self.open_log_file).grid(
+            row=2, column=1, sticky="ew", pady=(6, 0), padx=(6, 0)
         )
 
-        self.log = ScrolledText(frame, height=18)
-        self.log.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=6)
-        frame.rowconfigure(6, weight=1)
+        version_label = ttk.Label(
+            frame, text=f"Version {APP_VERSION}", foreground="#666666"
+        )
+        version_label.grid(row=4, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
         self._log(f"Input folder: {self.paths['input']}")
         self._log(f"Output folder: {self.paths['output']}")
+        self._log(f"Log file: {self.log_file}")
 
     def _build_menu(self) -> None:
         menu_bar = Menu(self.root)
         settings_menu = Menu(menu_bar, tearoff=0)
         settings_menu.add_command(label="Settings", command=self.open_settings_dialog)
+        settings_menu.add_command(label="Open output folder", command=self.open_output)
         menu_bar.add_cascade(label="Options", menu=settings_menu)
+        log_menu = Menu(menu_bar, tearoff=0)
+        log_menu.add_command(label="Open log file", command=self.open_log_file)
+        log_menu.add_command(label="Export log", command=self.export_log)
+        menu_bar.add_cascade(label="Logs", menu=log_menu)
         self.root.config(menu=menu_bar)
 
     def open_settings_dialog(self) -> None:
@@ -529,6 +664,7 @@ class EpubBuilderApp:
 
         frame = ttk.Frame(dialog, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
 
         ttk.Label(frame, text="OpenAI API Key").grid(row=0, column=0, sticky="w")
         api_entry = ttk.Entry(frame, width=60)
@@ -555,8 +691,57 @@ class EpubBuilderApp:
         toc_de.grid(row=9, column=0, sticky="ew", pady=(0, 10))
         toc_de.insert("1.0", self.settings.toc_prompt_de)
 
+        ttk.Label(frame, text="PDF image folder").grid(row=10, column=0, sticky="w")
+        pdf_dir_frame = ttk.Frame(frame)
+        pdf_dir_frame.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+        pdf_dir_frame.columnconfigure(0, weight=1)
+        pdf_dir_entry = ttk.Entry(pdf_dir_frame, width=60)
+        pdf_dir_entry.grid(row=0, column=0, sticky="ew")
+        pdf_dir_entry.insert(0, self.settings.pdf_images_dir)
+
+        def choose_pdf_dir() -> None:
+            path = filedialog.askdirectory(title="Select PDF image folder")
+            if path:
+                pdf_dir_entry.delete(0, "end")
+                pdf_dir_entry.insert(0, path)
+
+        ttk.Button(pdf_dir_frame, text="Browse", command=choose_pdf_dir).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+
+        ttk.Label(frame, text="TOC image folder").grid(row=12, column=0, sticky="w")
+        toc_dir_frame = ttk.Frame(frame)
+        toc_dir_frame.grid(row=13, column=0, sticky="ew", pady=(0, 10))
+        toc_dir_frame.columnconfigure(0, weight=1)
+        toc_dir_entry = ttk.Entry(toc_dir_frame, width=60)
+        toc_dir_entry.grid(row=0, column=0, sticky="ew")
+        toc_dir_entry.insert(0, self.settings.toc_images_dir)
+
+        def choose_toc_dir() -> None:
+            path = filedialog.askdirectory(title="Select TOC image folder")
+            if path:
+                toc_dir_entry.delete(0, "end")
+                toc_dir_entry.insert(0, path)
+
+        ttk.Button(toc_dir_frame, text="Browse", command=choose_toc_dir).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+
+        keep_pdf_var = BooleanVar(value=self.settings.keep_pdf_images)
+        keep_toc_var = BooleanVar(value=self.settings.keep_toc_images)
+        ttk.Checkbutton(
+            frame,
+            text="Keep PDF images after OCR",
+            variable=keep_pdf_var,
+        ).grid(row=14, column=0, sticky="w")
+        ttk.Checkbutton(
+            frame,
+            text="Keep TOC images after OCR",
+            variable=keep_toc_var,
+        ).grid(row=15, column=0, sticky="w")
+
         button_frame = ttk.Frame(frame)
-        button_frame.grid(row=10, column=0, sticky="e")
+        button_frame.grid(row=16, column=0, sticky="e", pady=(10, 0))
 
         def save_and_close() -> None:
             self.settings = AppSettings(
@@ -565,8 +750,14 @@ class EpubBuilderApp:
                 ocr_prompt_de=ocr_de.get("1.0", "end").strip(),
                 toc_prompt_en=toc_en.get("1.0", "end").strip(),
                 toc_prompt_de=toc_de.get("1.0", "end").strip(),
+                pdf_images_dir=pdf_dir_entry.get().strip(),
+                toc_images_dir=toc_dir_entry.get().strip(),
+                keep_pdf_images=keep_pdf_var.get(),
+                keep_toc_images=keep_toc_var.get(),
             )
             save_settings(self.settings)
+            self.paths = ensure_dirs(self.settings)
+            self.log_file = self.paths["logs"] / "bulk_ocr.log"
             self._log("Settings saved.")
             dialog.destroy()
 
@@ -578,8 +769,15 @@ class EpubBuilderApp:
         )
 
     def _log(self, message: str) -> None:
-        self.log.insert("end", f"[{timestamp()}] {message}\n")
+        entry = f"[{timestamp()}] {message}"
+        self.log.insert("end", f"{entry}\n")
         self.log.see("end")
+        try:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"{entry}\n")
+        except Exception:
+            return
 
     def _ocr_prompt_for_language(self, language: str) -> str:
         if language == "german":
@@ -593,6 +791,32 @@ class EpubBuilderApp:
 
     def clear_log(self) -> None:
         self.log.delete("1.0", "end")
+        try:
+            if self.log_file.exists():
+                self.log_file.unlink()
+        except Exception:
+            return
+
+    def export_log(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export log",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt")],
+        )
+        if not path:
+            return
+        content = self.log.get("1.0", "end").strip()
+        try:
+            Path(path).write_text(content, encoding="utf-8")
+            self._log(f"Log exported to: {path}")
+        except Exception as exc:
+            messagebox.showerror("Export failed", f"Could not export log: {exc}")
+
+    def open_log_file(self) -> None:
+        if not self.log_file.exists():
+            self._log("Log file does not exist yet.")
+            return
+        open_output_folder(self.log_file)
 
     def select_pdf(self) -> None:
         path = filedialog.askopenfilename(
@@ -637,6 +861,7 @@ class EpubBuilderApp:
             selected_indices,
             self.paths["tocimgs"],
             zoom=3.0,
+            cleanup=not self.settings.keep_toc_images,
             log_fn=self._log,
         )
         self._log(f"Selected {len(self.toc_paths)} TOC page(s)")
@@ -646,7 +871,7 @@ class EpubBuilderApp:
     ) -> List[int]:
         dialog = Toplevel(self.root)
         dialog.title("Select TOC Pages")
-        dialog.geometry("900x650")
+        dialog.geometry("1200x700")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -672,10 +897,10 @@ class EpubBuilderApp:
 
         thumbnail_refs: List[ImageTk.PhotoImage] = []
         vars_by_index: List[IntVar] = []
-        columns = 5
+        columns = 6
         for index in range(page_count):
             page = doc.load_page(index)
-            image = render_pdf_page_thumbnail(page, zoom=0.22)
+            image = render_pdf_page_thumbnail(page, zoom=0.18)
             photo = ImageTk.PhotoImage(image)
             thumbnail_refs.append(photo)
             var = IntVar(value=0)
@@ -746,6 +971,12 @@ class EpubBuilderApp:
                 prompt_override=self._toc_prompt_for_language(language),
                 log_fn=self._log,
             )
+            if not self.settings.keep_toc_images:
+                for image_path in self.toc_paths:
+                    try:
+                        image_path.unlink()
+                    except Exception:
+                        continue
             if not toc_entries:
                 messagebox.showerror("TOC OCR failed", "No TOC entries detected.")
                 return
@@ -771,9 +1002,12 @@ class EpubBuilderApp:
 
     def _process_pdf(self, client: OpenAI) -> tuple[str, str]:
         pdfimgs_dir = self.paths["pdfimgs"]
-        for item in pdfimgs_dir.glob("*.png"):
-            item.unlink()
-        images = extract_pdf_images(self.pdf_path, pdfimgs_dir, log_fn=self._log)
+        images = extract_pdf_images(
+            self.pdf_path,
+            pdfimgs_dir,
+            cleanup=not self.settings.keep_pdf_images,
+            log_fn=self._log,
+        )
         if not images:
             raise ValueError("No images extracted from PDF.")
         self._log("Running quick OCR for language detection")
@@ -794,6 +1028,12 @@ class EpubBuilderApp:
             prompt_override=self._ocr_prompt_for_language(language),
             log_fn=self._log,
         )
+        if not self.settings.keep_pdf_images:
+            for image_path in images:
+                try:
+                    image_path.unlink()
+                except Exception:
+                    continue
         return full_text, language
 
 
