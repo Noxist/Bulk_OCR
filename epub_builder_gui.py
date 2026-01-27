@@ -33,7 +33,7 @@ from tkinter import ttk
 # ============================================================
 # OpenAI API KEY (replace this with your own key)
 # ============================================================
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 OPENAI_API_KEY = "REPLACE_WITH_YOUR_API_KEY"
 OPENAI_MODEL_VISION = "gpt-4o-mini"
 DEFAULT_OCR_PROMPT_EN = (
@@ -75,6 +75,17 @@ class AppSettings:
     toc_images_dir: str
     keep_pdf_images: bool
     keep_toc_images: bool
+
+
+@dataclass
+class OcrState:
+    pdf_path: str
+    image_dir: str
+    image_files: List[str]
+    language: str
+    current_index: int
+    text_chunks: List[str]
+    created_at: str
 
 
 @dataclass
@@ -159,6 +170,53 @@ def ensure_dirs(settings: AppSettings) -> dict:
 def settings_path() -> Path:
     return get_app_data_dir() / "settings.json"
 
+
+def ocr_state_path() -> Path:
+    return get_app_data_dir() / "logs" / "ocr_state.json"
+
+
+def ocr_progress_text_path() -> Path:
+    return get_app_data_dir() / "logs" / "ocr_progress.txt"
+
+
+def load_ocr_state() -> Optional[OcrState]:
+    path = ocr_state_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return OcrState(
+        pdf_path=data.get("pdf_path", ""),
+        image_dir=data.get("image_dir", ""),
+        image_files=list(data.get("image_files", [])),
+        language=data.get("language", "english"),
+        current_index=int(data.get("current_index", 0)),
+        text_chunks=list(data.get("text_chunks", [])),
+        created_at=data.get("created_at", ""),
+    )
+
+
+def save_ocr_state(state: OcrState) -> None:
+    path = ocr_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "pdf_path": state.pdf_path,
+        "image_dir": state.image_dir,
+        "image_files": state.image_files,
+        "language": state.language,
+        "current_index": state.current_index,
+        "text_chunks": state.text_chunks,
+        "created_at": state.created_at,
+    }
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def clear_ocr_state() -> None:
+    path = ocr_state_path()
+    if path.exists():
+        path.unlink()
 
 def load_settings() -> AppSettings:
     default_api_key = os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)
@@ -559,6 +617,7 @@ class EpubBuilderApp:
         self.settings = load_settings()
         self.paths = ensure_dirs(self.settings)
         self.log_file = self.paths["logs"] / "bulk_ocr.log"
+        self.progress_text_file = ocr_progress_text_path()
         self._icon_photo: Optional[ImageTk.PhotoImage] = None
 
         self._configure_style()
@@ -569,6 +628,11 @@ class EpubBuilderApp:
         self.pdf_path: Optional[Path] = None
         self.txt_path: Optional[Path] = None
         self.toc_paths: List[Path] = []
+        self.pause_event = threading.Event()
+        self.is_running = False
+        self.progress_var = IntVar(value=0)
+        self.progress_label_var = StringVar(value="OCR progress: 0%")
+        self.pause_button: Optional[ttk.Button] = None
 
         self._build_ui()
         if not self.settings.api_key or self.settings.api_key == "REPLACE_WITH_YOUR_API_KEY":
@@ -641,17 +705,36 @@ class EpubBuilderApp:
         ttk.Button(action_frame, text="Select text file", command=self.select_txt).grid(
             row=0, column=1, sticky="ew", pady=4, padx=(6, 0)
         )
+        ttk.Button(
+            action_frame,
+            text="Create Batch JSONL",
+            command=self.create_batch_jsonl,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
 
         ttk.Button(frame, text="Start", command=self.start).grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
+        self.pause_button = ttk.Button(
+            frame, text="Pause", command=self.toggle_pause, state="disabled"
+        )
+        self.pause_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        progress_frame = ttk.Frame(frame)
+        progress_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        progress_frame.columnconfigure(0, weight=1)
+        progress_label = ttk.Label(progress_frame, textvariable=self.progress_label_var)
+        progress_label.grid(row=0, column=0, sticky="w")
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, maximum=100, variable=self.progress_var
+        )
+        self.progress_bar.grid(row=1, column=0, sticky="ew")
 
         log_frame = ttk.Labelframe(frame, text="Logs", padding=8)
-        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        log_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.columnconfigure(1, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(5, weight=1)
 
         self.log = ScrolledText(log_frame, height=18)
         self.log.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
@@ -669,11 +752,14 @@ class EpubBuilderApp:
         ttk.Button(log_frame, text="Open log file", command=self.open_log_file).grid(
             row=2, column=1, sticky="ew", pady=(6, 0), padx=(6, 0)
         )
+        ttk.Button(
+            log_frame, text="Open OCR progress text", command=self.open_progress_text
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         version_label = ttk.Label(
             frame, text=f"Version {APP_VERSION}", foreground="#666666"
         )
-        version_label.grid(row=4, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        version_label.grid(row=6, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
         self._log(f"Input folder: {self.paths['input']}")
         self._log(f"Output folder: {self.paths['output']}")
@@ -813,6 +899,49 @@ class EpubBuilderApp:
         except Exception:
             return
 
+    def _update_progress(self, current: int, total: int) -> None:
+        percent = int((current / total) * 100) if total else 0
+
+        def apply() -> None:
+            self.progress_var.set(percent)
+            self.progress_label_var.set(
+                f"OCR progress: {percent}% ({current}/{total})"
+            )
+
+        self.root.after(0, apply)
+
+    def _write_progress_text(self, text_chunks: List[str]) -> None:
+        try:
+            self.progress_text_file.parent.mkdir(parents=True, exist_ok=True)
+            text = "\n".join(text_chunks).strip()
+            self.progress_text_file.write_text(text, encoding="utf-8")
+        except Exception:
+            return
+
+    def _wait_if_paused(self) -> None:
+        while self.pause_event.is_set():
+            time.sleep(0.2)
+
+    def toggle_pause(self) -> None:
+        if not self.is_running:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            if self.pause_button:
+                self.pause_button.configure(text="Pause")
+            self._log("Resumed OCR processing.")
+        else:
+            self.pause_event.set()
+            if self.pause_button:
+                self.pause_button.configure(text="Resume")
+            self._log("Paused OCR processing.")
+
+    def open_progress_text(self) -> None:
+        if not self.progress_text_file.exists():
+            self._log("OCR progress text does not exist yet.")
+            return
+        open_output_folder(self.progress_text_file)
+
     def _ocr_prompt_for_language(self, language: str) -> str:
         if language == "german":
             return self.settings.ocr_prompt_de
@@ -870,6 +999,66 @@ class EpubBuilderApp:
         if path:
             self.txt_path = Path(path)
             self._log(f"Selected text file: {self.txt_path.name}")
+
+    def create_batch_jsonl(self) -> None:
+        if not self.pdf_path:
+            messagebox.showerror("Missing PDF", "Please select a PDF file first.")
+            return
+        use_german = messagebox.askyesno(
+            "Batch Prompt",
+            "Use the German OCR prompt for the batch file?\n"
+            "(Select 'No' to use English.)",
+        )
+        prompt = (
+            self.settings.ocr_prompt_de if use_german else self.settings.ocr_prompt_en
+        )
+        save_path = filedialog.asksaveasfilename(
+            title="Save Batch JSONL",
+            defaultextension=".jsonl",
+            filetypes=[("JSONL files", "*.jsonl")],
+        )
+        if not save_path:
+            return
+        self._log("Generating images for batch JSONL export.")
+        images = extract_pdf_images(
+            self.pdf_path,
+            self.paths["pdfimgs"],
+            cleanup=False,
+            log_fn=self._log,
+        )
+        if not images:
+            messagebox.showerror("Batch Export Failed", "No images extracted.")
+            return
+        lines: List[str] = []
+        for idx, image_path in enumerate(images, start=1):
+            b64 = encode_image_to_base64(image_path)
+            body = {
+                "model": OPENAI_MODEL_VISION,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{b64}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.0,
+            }
+            entry = {
+                "custom_id": f"{self.pdf_path.stem}_page_{idx:04d}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": body,
+            }
+            lines.append(json.dumps(entry, ensure_ascii=False))
+        Path(save_path).write_text("\n".join(lines), encoding="utf-8")
+        self._log(f"Batch JSONL saved: {save_path}")
 
     def _select_toc_pages_from_pdf(self) -> None:
         if not self.pdf_path:
@@ -971,6 +1160,11 @@ class EpubBuilderApp:
         return selected_indices
 
     def start(self) -> None:
+        if self.is_running:
+            messagebox.showwarning(
+                "Already running", "OCR processing is already running."
+            )
+            return
         thread = threading.Thread(target=self._run_pipeline, daemon=True)
         thread.start()
 
@@ -978,6 +1172,10 @@ class EpubBuilderApp:
         open_output_folder(self.paths["output"])
 
     def _run_pipeline(self) -> None:
+        self.is_running = True
+        if self.pause_button:
+            self.pause_button.configure(state="normal")
+        self._update_progress(0, 1)
         try:
             if not self.toc_paths:
                 messagebox.showerror("Missing TOC", "Please select TOC images.")
@@ -1030,9 +1228,15 @@ class EpubBuilderApp:
             create_epub("Generated Book", chapters, output_path, language)
             self._log(f"EPUB created: {output_path.name}")
             messagebox.showinfo("Done", f"EPUB created: {output_path.name}")
+            self._update_progress(1, 1)
         except Exception as exc:
             self._log(f"Error: {exc}")
             messagebox.showerror("Error", str(exc))
+        finally:
+            self.is_running = False
+            self.pause_event.clear()
+            if self.pause_button:
+                self.pause_button.configure(text="Pause", state="disabled")
 
     def _process_pdf(self, client: OpenAI) -> tuple[str, str]:
         pdfimgs_dir = self.paths["pdfimgs"]
@@ -1044,24 +1248,77 @@ class EpubBuilderApp:
         )
         if not images:
             raise ValueError("No images extracted from PDF.")
-        self._log("Running quick OCR for language detection")
-        sample_text = ocr_pages(
-            client,
-            [images[0]],
-            "english",
-            prompt_override=self._ocr_prompt_for_language("english"),
-            log_fn=self._log,
-        )
-        language = detect_language(sample_text)
-        self._log(f"Detected language: {language}")
+        state = load_ocr_state()
+        use_state = False
+        if state and self.pdf_path:
+            if (
+                state.pdf_path == self.pdf_path.as_posix()
+                and state.image_dir == pdfimgs_dir.as_posix()
+                and state.image_files == [path.name for path in images]
+            ):
+                resume = messagebox.askyesno(
+                    "Resume OCR",
+                    "An unfinished OCR session was found. Resume from last progress?",
+                )
+                if resume:
+                    use_state = True
+                else:
+                    clear_ocr_state()
+        if use_state and state:
+            language = state.language
+            text_chunks = list(state.text_chunks)
+            start_index = state.current_index
+            self._log(
+                f"Resuming OCR at page {start_index + 1} of {len(images)} (language: {language})."
+            )
+            self._write_progress_text(text_chunks)
+        else:
+            self._log("Running quick OCR for language detection")
+            sample_text = ocr_pages(
+                client,
+                [images[0]],
+                "english",
+                prompt_override=self._ocr_prompt_for_language("english"),
+                log_fn=self._log,
+            )
+            language = detect_language(sample_text)
+            self._log(f"Detected language: {language}")
+            text_chunks = []
+            start_index = 0
+            clear_ocr_state()
+            self._write_progress_text([])
+
         self._log("Starting OCR on PDF images")
-        full_text = ocr_pages(
-            client,
-            images,
-            language,
-            prompt_override=self._ocr_prompt_for_language(language),
-            log_fn=self._log,
-        )
+        total = len(images)
+        prompt = self._ocr_prompt_for_language(language)
+        for idx in range(start_index, total):
+            self._wait_if_paused()
+            self._log(f"OCR page {idx + 1}/{total}")
+            page_text = ocr_images_with_retry(
+                client,
+                [images[idx]],
+                prompt,
+                max_batch_size=1,
+                log_fn=self._log,
+            )
+            if len(text_chunks) <= idx:
+                text_chunks.extend([""] * (idx + 1 - len(text_chunks)))
+            text_chunks[idx] = page_text.strip()
+            state = OcrState(
+                pdf_path=self.pdf_path.as_posix(),
+                image_dir=pdfimgs_dir.as_posix(),
+                image_files=[path.name for path in images],
+                language=language,
+                current_index=idx + 1,
+                text_chunks=text_chunks,
+                created_at=timestamp(),
+            )
+            save_ocr_state(state)
+            self._write_progress_text(text_chunks)
+            self._update_progress(idx + 1, total)
+
+        clear_ocr_state()
+        full_text = "\n".join(text_chunks).strip()
         if not self.settings.keep_pdf_images:
             for image_path in images:
                 try:
