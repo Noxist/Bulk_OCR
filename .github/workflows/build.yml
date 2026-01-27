@@ -3,6 +3,12 @@ name: Build Windows EXE
 on:
   push:
     branches: ["main"]
+    paths:
+      - "main.py"
+      - "epub_builder_gui.py"
+      - "build_exe.py"
+      - "requirements.txt"
+      - "assets/**"
   workflow_dispatch:
 
 jobs:
@@ -23,11 +29,24 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Resolve version
+        id: version
+        run: |
+          $version = python -c "import re, pathlib; data = pathlib.Path('epub_builder_gui.py').read_text(encoding='utf-8'); match = re.search(r'APP_VERSION\\s*=\\s*\"([^\"]+)\"', data); print(match.group(1) if match else '0.0.0')"
+          echo "value=$version" >> $env:GITHUB_OUTPUT
+
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole epub_builder_gui.py
+        run: python build_exe.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: epub-builder-windows.exe
-          path: dist/epub_builder_gui.exe
+          name: BulkOCR-${{ steps.version.outputs.value }}.exe
+          path: dist/BulkOCR-${{ steps.version.outputs.value }}.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}-build.${{ github.run_number }}
+          name: BulkOCR v${{ steps.version.outputs.value }} (build ${{ github.run_number }})
+          files: dist/BulkOCR-${{ steps.version.outputs.value }}.exe
