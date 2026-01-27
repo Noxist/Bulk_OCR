@@ -575,7 +575,7 @@ class EpubBuilderApp:
             self.root.after(200, self.open_settings_dialog)
 
     def _configure_style(self) -> None:
-        self.root.option_add("*Font", "Segoe UI 10")
+        self.root.option_add("*Font", "{Segoe UI} 10")
         style = ttk.Style()
         try:
             style.theme_use("clam")
