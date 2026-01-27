@@ -1,15 +1,17 @@
 import base64
+import concurrent.futures
 import datetime as dt
-import json
 import html
+import json
+import math
 import os
 import re
+import sys
 import threading
 import time
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 import fitz  # PyMuPDF
 from ebooklib import epub
@@ -36,6 +38,7 @@ from tkinter import ttk
 APP_VERSION = "0.3.0"
 OPENAI_API_KEY = "REPLACE_WITH_YOUR_API_KEY"
 OPENAI_MODEL_VISION = "gpt-4o-mini"
+BATCH_MAX_FILE_BYTES = 140 * 1024 * 1024
 DEFAULT_OCR_PROMPT_EN = (
     "You are an OCR engine for audiobook-friendly text. Extract only the main body text visible in the "
     "image. Remove citation markers like [12], (Smith, 1999), or ¹, and drop footnote lines entirely. "
@@ -417,6 +420,90 @@ def ocr_images_with_retry(
     return "\n".join(outputs)
 
 
+def _write_batch_jsonl_entries(
+    entries: Iterable[str], base_path: Path, max_bytes: int, log_fn=None
+) -> List[Path]:
+    output_paths: List[Path] = []
+    base_stem = base_path.stem
+    use_parts = False
+    part_index = 1
+    current_path = base_path
+    current_size = 0
+
+    def open_handle(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.open("w", encoding="utf-8")
+
+    handle = open_handle(current_path)
+    output_paths.append(current_path)
+    for entry in entries:
+        entry_bytes = (entry + "\n").encode("utf-8")
+        if current_size + len(entry_bytes) > max_bytes and current_size > 0:
+            handle.close()
+            part_index += 1
+            if not use_parts:
+                part1_path = base_path.with_name(
+                    f"{base_stem}_part1{base_path.suffix}"
+                )
+                if part1_path != base_path:
+                    base_path.rename(part1_path)
+                    output_paths[0] = part1_path
+                use_parts = True
+            current_path = base_path.with_name(
+                f"{base_stem}_part{part_index}{base_path.suffix}"
+            )
+            handle = open_handle(current_path)
+            output_paths.append(current_path)
+            current_size = 0
+        handle.write(entry + "\n")
+        current_size += len(entry_bytes)
+    handle.close()
+    if log_fn and use_parts:
+        log_fn(
+            f"Batch JSONL split into {len(output_paths)} files (limit {max_bytes / (1024 * 1024):.0f}MB)."
+        )
+    return output_paths
+
+
+def _extract_batch_content(record: dict) -> Optional[str]:
+    response = record.get("response") or record.get("result") or {}
+    body = response.get("body") or {}
+    choices = body.get("choices") or []
+    if not choices:
+        return None
+    message = choices[0].get("message") or {}
+    return message.get("content")
+
+
+def parse_batch_result_files(paths: Sequence[Path], log_fn=None) -> str:
+    results: List[tuple[str, str]] = []
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"Failed to read batch file {path.name}: {exc}")
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                if log_fn:
+                    log_fn(f"Skipping invalid JSON line in {path.name}")
+                continue
+            custom_id = record.get("custom_id")
+            content = _extract_batch_content(record)
+            if not custom_id or content is None:
+                if log_fn:
+                    log_fn(f"Skipping incomplete batch record in {path.name}")
+                continue
+            results.append((custom_id, content))
+    results.sort(key=lambda item: item[0])
+    return "\n".join(content for _, content in results).strip()
+
+
 def ocr_pages(
     client: OpenAI, image_paths: List[Path], language: str, prompt_override: str, log_fn=None
 ) -> str:
@@ -453,23 +540,67 @@ def extract_pdf_images(
 ) -> List[Path]:
     if log_fn:
         log_fn(f"Rendering PDF pages to images: {pdf_path.name}")
-    doc = fitz.open(pdf_path)
-    image_paths: List[Path] = []
-    zoom = 2
-    mat = fitz.Matrix(zoom, zoom)
+    output_dir.mkdir(parents=True, exist_ok=True)
     if cleanup:
         for item in output_dir.glob("*.png"):
             item.unlink()
-    for page_index in range(doc.page_count):
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    doc.close()
+    if page_count == 0:
+        return []
+    zoom = 2
+    cpu_count = max(1, os.cpu_count() or 1)
+    worker_count = min(cpu_count, page_count)
+    page_indices = list(range(page_count))
+    if worker_count == 1:
+        paths = _render_pdf_page_range(
+            pdf_path.as_posix(), output_dir.as_posix(), page_indices, zoom
+        )
+    else:
+        chunk_size = math.ceil(page_count / worker_count)
+        chunks = [
+            page_indices[i : i + chunk_size]
+            for i in range(0, page_count, chunk_size)
+        ]
+        paths: List[str] = []
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _render_pdf_page_range,
+                    pdf_path.as_posix(),
+                    output_dir.as_posix(),
+                    chunk,
+                    zoom,
+                )
+                for chunk in chunks
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                paths.extend(future.result())
+    image_paths = sorted((Path(path) for path in paths), key=lambda p: p.name)
+    if log_fn:
+        for img_path in image_paths:
+            log_fn(f"Saved image: {img_path.name}")
+    return image_paths
+
+
+def _render_pdf_page_range(
+    pdf_path: str, output_dir: str, page_indices: Sequence[int], zoom: float
+) -> List[str]:
+    doc = fitz.open(pdf_path)
+    mat = fitz.Matrix(zoom, zoom)
+    output_paths: List[str] = []
+    output_base = Path(output_dir)
+    for page_index in page_indices:
         page = doc.load_page(page_index)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_path = output_dir / f"page_{page_index + 1:04d}.png"
+        img_path = output_base / f"page_{page_index + 1:04d}.png"
         pix.save(img_path.as_posix())
-        image_paths.append(img_path)
-        if log_fn:
-            log_fn(f"Saved image: {img_path.name}")
+        output_paths.append(img_path.as_posix())
     doc.close()
-    return image_paths
+    return output_paths
 
 
 def render_pdf_page_thumbnail(page: fitz.Page, zoom: float = 0.3) -> Image.Image:
@@ -627,6 +758,7 @@ class EpubBuilderApp:
         self.mode_var = StringVar(value="pdf")
         self.pdf_path: Optional[Path] = None
         self.txt_path: Optional[Path] = None
+        self.batch_result_paths: List[Path] = []
         self.toc_paths: List[Path] = []
         self.pause_event = threading.Event()
         self.is_running = False
@@ -691,8 +823,15 @@ class EpubBuilderApp:
             variable=self.mode_var,
             value="text",
         )
+        mode_batch = ttk.Radiobutton(
+            mode_frame,
+            text="Mode C: Import Batch Result → TOC images → EPUB",
+            variable=self.mode_var,
+            value="batch",
+        )
         mode_pdf.grid(row=0, column=0, columnspan=2, sticky="w")
         mode_txt.grid(row=1, column=0, columnspan=2, sticky="w")
+        mode_batch.grid(row=2, column=0, columnspan=2, sticky="w")
 
         action_frame = ttk.Labelframe(frame, text="Source Files", padding=8)
         action_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -710,6 +849,11 @@ class EpubBuilderApp:
             text="Create Batch JSONL",
             command=self.create_batch_jsonl,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(
+            action_frame,
+            text="Select batch result JSONL",
+            command=self.select_batch_results,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=4)
 
         ttk.Button(frame, text="Start", command=self.start).grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
@@ -1000,6 +1144,16 @@ class EpubBuilderApp:
             self.txt_path = Path(path)
             self._log(f"Selected text file: {self.txt_path.name}")
 
+    def select_batch_results(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Select Batch Result JSONL",
+            filetypes=[("JSONL files", "*.jsonl")],
+        )
+        if paths:
+            self.batch_result_paths = [Path(path) for path in paths]
+            names = ", ".join(path.name for path in self.batch_result_paths)
+            self._log(f"Selected batch result files: {names}")
+
     def create_batch_jsonl(self) -> None:
         if not self.pdf_path:
             messagebox.showerror("Missing PDF", "Please select a PDF file first.")
@@ -1019,6 +1173,14 @@ class EpubBuilderApp:
         )
         if not save_path:
             return
+        thread = threading.Thread(
+            target=self._create_batch_jsonl_worker,
+            args=(prompt, Path(save_path)),
+            daemon=True,
+        )
+        thread.start()
+
+    def _create_batch_jsonl_worker(self, prompt: str, save_path: Path) -> None:
         self._log("Generating images for batch JSONL export.")
         images = extract_pdf_images(
             self.pdf_path,
@@ -1029,36 +1191,45 @@ class EpubBuilderApp:
         if not images:
             messagebox.showerror("Batch Export Failed", "No images extracted.")
             return
-        lines: List[str] = []
-        for idx, image_path in enumerate(images, start=1):
-            b64 = encode_image_to_base64(image_path)
-            body = {
-                "model": OPENAI_MODEL_VISION,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{b64}"
+        pdf_stem = self.pdf_path.stem
+
+        def iter_entries() -> Iterable[str]:
+            for idx, image_path in enumerate(images, start=1):
+                b64 = encode_image_to_base64(image_path)
+                body = {
+                    "model": OPENAI_MODEL_VISION,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{b64}"
+                                    },
                                 },
-                            },
-                        ],
-                    }
-                ],
-                "temperature": 0.0,
-            }
-            entry = {
-                "custom_id": f"{self.pdf_path.stem}_page_{idx:04d}",
-                "method": "POST",
-                "url": "/v1/chat/completions",
-                "body": body,
-            }
-            lines.append(json.dumps(entry, ensure_ascii=False))
-        Path(save_path).write_text("\n".join(lines), encoding="utf-8")
-        self._log(f"Batch JSONL saved: {save_path}")
+                            ],
+                        }
+                    ],
+                    "temperature": 0.0,
+                }
+                entry = {
+                    "custom_id": f"{pdf_stem}_page_{idx:04d}",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": body,
+                }
+                yield json.dumps(entry, ensure_ascii=False)
+
+        output_paths = _write_batch_jsonl_entries(
+            iter_entries(), save_path, BATCH_MAX_FILE_BYTES, log_fn=self._log
+        )
+        if len(output_paths) == 1:
+            self._log(f"Batch JSONL saved: {output_paths[0]}")
+        else:
+            names = ", ".join(path.name for path in output_paths)
+            self._log(f"Batch JSONL saved: {names}")
 
     def _select_toc_pages_from_pdf(self) -> None:
         if not self.pdf_path:
@@ -1177,18 +1348,37 @@ class EpubBuilderApp:
             self.pause_button.configure(state="normal")
         self._update_progress(0, 1)
         try:
-            if not self.toc_paths:
-                messagebox.showerror("Missing TOC", "Please select TOC images.")
-                return
-
             client = build_openai_client(self.settings.api_key)
-
-            if self.mode_var.get() == "pdf":
+            mode = self.mode_var.get()
+            if mode == "batch":
+                if not self.pdf_path:
+                    messagebox.showerror("Missing PDF", "Please select a PDF file.")
+                    return
+                if not self.batch_result_paths:
+                    messagebox.showerror(
+                        "Missing batch result",
+                        "Please select batch result JSONL files.",
+                    )
+                    return
+                text, language = self._process_batch_results()
+                self._select_toc_pages_from_pdf()
+                if not self.toc_paths:
+                    messagebox.showerror(
+                        "Missing TOC", "Please select TOC images."
+                    )
+                    return
+            elif mode == "pdf":
+                if not self.toc_paths:
+                    messagebox.showerror("Missing TOC", "Please select TOC images.")
+                    return
                 if not self.pdf_path:
                     messagebox.showerror("Missing PDF", "Please select a PDF file.")
                     return
                 text, language = self._process_pdf(client)
             else:
+                if not self.toc_paths:
+                    messagebox.showerror("Missing TOC", "Please select TOC images.")
+                    return
                 if not self.txt_path:
                     messagebox.showerror("Missing text", "Please select a text file.")
                     return
@@ -1326,6 +1516,17 @@ class EpubBuilderApp:
                 except Exception:
                     continue
         return full_text, language
+
+    def _process_batch_results(self) -> tuple[str, str]:
+        if not self.batch_result_paths:
+            raise ValueError("No batch result files selected.")
+        self._log("Importing batch results and reconstructing text.")
+        text = parse_batch_result_files(self.batch_result_paths, log_fn=self._log)
+        if not text:
+            raise ValueError("No OCR text found in batch results.")
+        language = detect_language(text)
+        self._log(f"Detected language: {language}")
+        return text, language
 
 
 def main() -> None:
