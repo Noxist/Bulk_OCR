@@ -400,7 +400,12 @@ def ocr_images_with_retry(
         while True:
             try:
                 log(f"OCR: processing batch of {len(batch)} image(s)")
-                outputs.append(call_vision(batch))
+                result = call_vision(batch)
+                if not result:
+                    log("OCR returned empty content. Inserting placeholder.")
+                    outputs.append("\n\n[[!! ERROR: EMPTY RESPONSE FROM AI !!]]\n\n")
+                else:
+                    outputs.append(result)
                 break
             except Exception as exc:
                 if attempts < len(backoffs):
@@ -431,7 +436,8 @@ def ocr_images_with_retry(
                         )
                     )
                     break
-                raise exc
+                log("OCR failed permanently for this batch. Inserting placeholder.")
+                return "\n\n[[!! ERROR: OCR FAILED FOR THIS SECTION (Check Image) !!]]\n\n"
     return "\n".join(outputs)
 
 
@@ -540,6 +546,10 @@ def ocr_toc(
     entries: List[TocEntry] = []
     seen = set()
     for line in raw.splitlines():
+        if line.strip().startswith("[[!! ERROR"):
+            if log_fn:
+                log_fn("TOC OCR returned an error placeholder; skipping line.")
+            continue
         if ":::" not in line:
             continue
         title, page = [part.strip() for part in line.split(":::", 1)]
