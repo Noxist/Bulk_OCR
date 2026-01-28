@@ -36,6 +36,16 @@ def resolve_icon() -> Path | None:
 def build_exe() -> None:
     version = get_version()
     exe_name = f"BulkOCR-{version}"
+    hidden_imports = [
+        "--hidden-import",
+        "addons.jsonl_upload",
+        "--hidden-import",
+        "addons.batch_manager",
+        "--hidden-import",
+        "addons.jsonl_to_txt",
+        "--hidden-import",
+        "addons.ai_text_refiner",
+    ]
     command = [
         "pyinstaller",
         "--onefile",
@@ -44,6 +54,7 @@ def build_exe() -> None:
         exe_name,
         "main.py",
     ]
+    command.extend(hidden_imports)
     icon_path = resolve_icon()
     if icon_path:
         command.extend(["--icon", icon_path.as_posix()])

@@ -31,6 +31,41 @@ from tkinter import (
 )
 from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
+import importlib.util
+
+ADDONS_AVAILABLE = {}
+BatchUploaderApp = None
+BatchManagerApp = None
+JsonlToTxtApp = None
+AiTextRefinerApp = None
+
+if importlib.util.find_spec("addons.jsonl_upload"):
+    from addons.jsonl_upload import BatchUploaderApp
+
+    ADDONS_AVAILABLE["uploader"] = True
+else:
+    ADDONS_AVAILABLE["uploader"] = False
+
+if importlib.util.find_spec("addons.batch_manager"):
+    from addons.batch_manager import BatchManagerApp
+
+    ADDONS_AVAILABLE["manager"] = True
+else:
+    ADDONS_AVAILABLE["manager"] = False
+
+if importlib.util.find_spec("addons.jsonl_to_txt"):
+    from addons.jsonl_to_txt import JsonlToTxtApp
+
+    ADDONS_AVAILABLE["converter"] = True
+else:
+    ADDONS_AVAILABLE["converter"] = False
+
+if importlib.util.find_spec("addons.ai_text_refiner"):
+    from addons.ai_text_refiner import AiTextRefinerApp
+
+    ADDONS_AVAILABLE["refiner"] = True
+else:
+    ADDONS_AVAILABLE["refiner"] = False
 
 # ============================================================
 # OpenAI API KEY (replace this with your own key)
@@ -74,9 +109,6 @@ class AppSettings:
     ocr_prompt_de: str
     toc_prompt_en: str
     toc_prompt_de: str
-    output_dir: str
-    pdf_images_dir: str
-    toc_images_dir: str
     keep_pdf_images: bool
     keep_toc_images: bool
 
@@ -116,75 +148,52 @@ def get_app_data_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def default_paths() -> dict:
-    base = get_app_data_dir()
+def project_paths(project_root: Path) -> dict:
+    images_dir = project_root / "_images"
     return {
-        "base": base,
-        "input": base / "input",
-        "output": base / "output",
-        "pdfimgs": base / "input" / "_pdfimgs",
-        "tocimgs": base / "input" / "_tocimgs",
-        "logs": base / "logs",
+        "base": project_root,
+        "images": images_dir,
+        "jsonl": project_root / "_jsonl",
+        "logs": project_root / "_logs",
+        "output": project_root / "_output",
+        "pdfimgs": images_dir / "pdf",
+        "tocimgs": images_dir / "toc",
     }
 
 
-def ensure_dirs(settings: AppSettings) -> dict:
-    paths = default_paths()
-    input_dir = paths["input"]
-    output_dir = Path(settings.output_dir) if settings.output_dir else paths["output"]
-    pdfimgs_dir = (
-        Path(settings.pdf_images_dir)
-        if settings.pdf_images_dir
-        else paths["pdfimgs"]
-    )
-    tocimgs_dir = (
-        Path(settings.toc_images_dir)
-        if settings.toc_images_dir
-        else paths["tocimgs"]
-    )
-    log_dir = paths["logs"]
-    
-    # Attempt to create directories. If we are in a read-only location (like Program Files)
-    # and not running as admin, this might fail. We wrap it to provide a helpful error 
-    # or fallback could be implemented here (but per request, we keep it 'in location').
+def ensure_project_dirs(project_root: Path) -> dict:
+    paths = project_paths(project_root)
     try:
-        input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        pdfimgs_dir.mkdir(parents=True, exist_ok=True)
-        tocimgs_dir.mkdir(parents=True, exist_ok=True)
-        log_dir.mkdir(parents=True, exist_ok=True)
+        paths["images"].mkdir(parents=True, exist_ok=True)
+        paths["jsonl"].mkdir(parents=True, exist_ok=True)
+        paths["logs"].mkdir(parents=True, exist_ok=True)
+        paths["output"].mkdir(parents=True, exist_ok=True)
+        paths["pdfimgs"].mkdir(parents=True, exist_ok=True)
+        paths["tocimgs"].mkdir(parents=True, exist_ok=True)
     except PermissionError:
         messagebox.showerror(
-            "Permission Error", 
-            f"Could not create folders in {paths['base']}.\n\n"
-            "If you installed to 'Program Files', try running the app as Administrator "
-            "or install to a user folder (e.g. C:\\Users\\Name\\BulkOCR)."
+            "Permission Error",
+            f"Could not create folders in {project_root}.\n\n"
+            "Try selecting a project folder you have write access to.",
         )
 
-    return {
-        "base": paths["base"],
-        "input": input_dir,
-        "output": output_dir,
-        "pdfimgs": pdfimgs_dir,
-        "tocimgs": tocimgs_dir,
-        "logs": log_dir,
-    }
+    return paths
 
 
 def settings_path() -> Path:
     return get_app_data_dir() / "settings.json"
 
 
-def ocr_state_path() -> Path:
-    return get_app_data_dir() / "logs" / "ocr_state.json"
+def ocr_state_path(log_dir: Path) -> Path:
+    return log_dir / "ocr_state.json"
 
 
-def ocr_progress_text_path() -> Path:
-    return get_app_data_dir() / "logs" / "ocr_progress.txt"
+def ocr_progress_text_path(log_dir: Path) -> Path:
+    return log_dir / "ocr_progress.txt"
 
 
-def load_ocr_state() -> Optional[OcrState]:
-    path = ocr_state_path()
+def load_ocr_state(log_dir: Path) -> Optional[OcrState]:
+    path = ocr_state_path(log_dir)
     if not path.exists():
         return None
     try:
@@ -202,8 +211,8 @@ def load_ocr_state() -> Optional[OcrState]:
     )
 
 
-def save_ocr_state(state: OcrState) -> None:
-    path = ocr_state_path()
+def save_ocr_state(state: OcrState, log_dir: Path) -> None:
+    path = ocr_state_path(log_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "pdf_path": state.pdf_path,
@@ -217,23 +226,19 @@ def save_ocr_state(state: OcrState) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def clear_ocr_state() -> None:
-    path = ocr_state_path()
+def clear_ocr_state(log_dir: Path) -> None:
+    path = ocr_state_path(log_dir)
     if path.exists():
         path.unlink()
 
 def load_settings() -> AppSettings:
     default_api_key = os.environ.get("OPENAI_API_KEY", OPENAI_API_KEY)
-    default_dirs = default_paths()
     defaults = AppSettings(
         api_key=default_api_key,
         ocr_prompt_en=DEFAULT_OCR_PROMPT_EN,
         ocr_prompt_de=DEFAULT_OCR_PROMPT_DE,
         toc_prompt_en=DEFAULT_TOC_PROMPT_EN,
         toc_prompt_de=DEFAULT_TOC_PROMPT_DE,
-        output_dir=str(default_dirs["output"]),
-        pdf_images_dir=str(default_dirs["pdfimgs"]),
-        toc_images_dir=str(default_dirs["tocimgs"]),
         keep_pdf_images=False,
         keep_toc_images=True,
     )
@@ -250,9 +255,6 @@ def load_settings() -> AppSettings:
         ocr_prompt_de=data.get("ocr_prompt_de", defaults.ocr_prompt_de),
         toc_prompt_en=data.get("toc_prompt_en", defaults.toc_prompt_en),
         toc_prompt_de=data.get("toc_prompt_de", defaults.toc_prompt_de),
-        output_dir=data.get("output_dir", defaults.output_dir),
-        pdf_images_dir=data.get("pdf_images_dir", defaults.pdf_images_dir),
-        toc_images_dir=data.get("toc_images_dir", defaults.toc_images_dir),
         keep_pdf_images=data.get("keep_pdf_images", defaults.keep_pdf_images),
         keep_toc_images=data.get("keep_toc_images", defaults.keep_toc_images),
     )
@@ -268,9 +270,6 @@ def save_settings(settings: AppSettings) -> None:
             "ocr_prompt_de": settings.ocr_prompt_de,
             "toc_prompt_en": settings.toc_prompt_en,
             "toc_prompt_de": settings.toc_prompt_de,
-            "output_dir": settings.output_dir,
-            "pdf_images_dir": settings.pdf_images_dir,
-            "toc_images_dir": settings.toc_images_dir,
             "keep_pdf_images": settings.keep_pdf_images,
             "keep_toc_images": settings.keep_toc_images,
         }
@@ -357,7 +356,7 @@ def find_icon_file() -> Optional[Path]:
 def build_openai_client(api_key: str) -> OpenAI:
     if not api_key or api_key == "REPLACE_WITH_YOUR_API_KEY":
         raise ValueError(
-            "OpenAI API key is missing. Please edit OPENAI_API_KEY in epub_builder_gui.py."
+            "OpenAI API key is missing. Please enter it in Settings."
         )
     return OpenAI(api_key=api_key)
 
@@ -758,13 +757,23 @@ def create_epub(
     epub.write_epub(output_path.as_posix(), book, {})
 
 
+def build_markdown(chapters: List[dict]) -> str:
+    sections = []
+    for chapter in chapters:
+        title = chapter.get("title") or "Untitled"
+        body = chapter.get("text", "").strip()
+        sections.append(f"# {title}\n\n{body}".strip())
+    return "\n\n".join(sections).strip() + "\n"
+
+
 class EpubBuilderApp:
     def __init__(self, root: Tk):
         self.root = root
         self.settings = load_settings()
-        self.paths = ensure_dirs(self.settings)
+        self.project_root = get_app_data_dir()
+        self.paths = ensure_project_dirs(self.project_root)
         self.log_file = self.paths["logs"] / "bulk_ocr.log"
-        self.progress_text_file = ocr_progress_text_path()
+        self.progress_text_file = ocr_progress_text_path(self.paths["logs"])
         self._icon_photo: Optional[ImageTk.PhotoImage] = None
 
         self._configure_style()
@@ -773,6 +782,7 @@ class EpubBuilderApp:
 
         self.mode_var = StringVar(value="pdf")
         self.skip_toc_var = BooleanVar(value=False)
+        self.skip_epub_var = BooleanVar(value=False)
         self.stack_images_var = BooleanVar(value=True)
         self.stack_batch_size_var = IntVar(value=4)
         self.pdf_path: Optional[Path] = None
@@ -784,10 +794,15 @@ class EpubBuilderApp:
         self.is_running = False
         self.progress_var = IntVar(value=0)
         self.progress_label_var = StringVar(value="OCR progress: 0%")
+        self.eta_label_var = StringVar(value="ETA: --")
         self.pause_button: Optional[ttk.Button] = None
+        self.start_time: Optional[float] = None
 
         self._build_ui()
-        if not self.settings.api_key or self.settings.api_key == "REPLACE_WITH_YOUR_API_KEY":
+        if (
+            not self.settings.api_key
+            or self.settings.api_key == "REPLACE_WITH_YOUR_API_KEY"
+        ):
             self.root.after(200, self.open_settings_dialog)
 
     def _configure_style(self) -> None:
@@ -824,9 +839,23 @@ class EpubBuilderApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
 
-        mode_frame = ttk.Labelframe(frame, text="Input Mode", padding=8)
+        self.notebook = ttk.Notebook(frame)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+
+        dashboard_tab = ttk.Frame(self.notebook, padding=10)
+        tools_tab = ttk.Frame(self.notebook, padding=10)
+        settings_tab = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(dashboard_tab, text="Dashboard")
+        self.notebook.add(tools_tab, text="Tools")
+        self.notebook.add(settings_tab, text="Settings & Logs")
+
+        dashboard_tab.columnconfigure(0, weight=1)
+        dashboard_tab.columnconfigure(1, weight=1)
+
+        mode_frame = ttk.Labelframe(dashboard_tab, text="Input Mode", padding=8)
         mode_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         mode_frame.columnconfigure(0, weight=1)
         mode_frame.columnconfigure(1, weight=1)
@@ -866,7 +895,7 @@ class EpubBuilderApp:
             variable=self.skip_toc_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        action_frame = ttk.Labelframe(frame, text="Source Files", padding=8)
+        action_frame = ttk.Labelframe(dashboard_tab, text="Source Files", padding=8)
         action_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         action_frame.columnconfigure(0, weight=1)
         action_frame.columnconfigure(1, weight=1)
@@ -893,7 +922,7 @@ class EpubBuilderApp:
             command=self.select_image_folder,
         ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=4)
 
-        options_frame = ttk.Labelframe(frame, text="Image OCR Options", padding=8)
+        options_frame = ttk.Labelframe(dashboard_tab, text="Options", padding=8)
         options_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         options_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
@@ -911,31 +940,134 @@ class EpubBuilderApp:
             textvariable=self.stack_batch_size_var,
             width=6,
         ).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            options_frame,
+            text="Generate Markdown/TXT only (Skip EPUB)",
+            variable=self.skip_epub_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        ttk.Button(frame, text="Start", command=self.start).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+        action_buttons = ttk.Frame(dashboard_tab)
+        action_buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        action_buttons.columnconfigure(0, weight=1)
+        action_buttons.columnconfigure(1, weight=1)
+
+        ttk.Button(action_buttons, text="Start", command=self.start).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
         )
         self.pause_button = ttk.Button(
-            frame, text="Pause", command=self.toggle_pause, state="disabled"
+            action_buttons, text="Pause", command=self.toggle_pause, state="disabled"
         )
-        self.pause_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.pause_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-        progress_frame = ttk.Frame(frame)
-        progress_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        progress_frame = ttk.Frame(dashboard_tab)
+        progress_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         progress_frame.columnconfigure(0, weight=1)
         progress_label = ttk.Label(progress_frame, textvariable=self.progress_label_var)
         progress_label.grid(row=0, column=0, sticky="w")
-        self.progress_bar = ttk.Progressbar(
-            progress_frame, maximum=100, variable=self.progress_var
-        )
-        self.progress_bar.grid(row=1, column=0, sticky="ew")
 
-        log_frame = ttk.Labelframe(frame, text="Logs", padding=8)
-        log_frame.grid(row=6, column=0, columnspan=2, sticky="nsew")
+        progress_bar_frame = ttk.Frame(progress_frame)
+        progress_bar_frame.grid(row=1, column=0, sticky="ew")
+        progress_bar_frame.columnconfigure(0, weight=1)
+        self.progress_bar = ttk.Progressbar(
+            progress_bar_frame, maximum=100, variable=self.progress_var
+        )
+        self.progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(progress_bar_frame, textvariable=self.eta_label_var).grid(
+            row=0, column=1, sticky="e", padx=(10, 0)
+        )
+
+        version_label = ttk.Label(
+            dashboard_tab, text=f"Version {APP_VERSION}", foreground="#666666"
+        )
+        version_label.grid(row=5, column=0, columnspan=2, sticky="e", pady=(6, 0))
+
+        tools_tab.columnconfigure(0, weight=1)
+        tool_frame = ttk.LabelFrame(tools_tab, text="Workbench Tools", padding=12)
+        tool_frame.grid(row=0, column=0, sticky="nsew")
+        tool_frame.columnconfigure(0, weight=1)
+        tool_frame.columnconfigure(1, weight=1)
+
+        def tool_button(row, column, text, app_class, key):
+            state = "normal" if ADDONS_AVAILABLE.get(key) else "disabled"
+            btn = ttk.Button(
+                tool_frame,
+                text=text,
+                command=lambda: self._launch_addon_window(app_class, text),
+                state=state,
+            )
+            btn.grid(row=row, column=column, sticky="ew", padx=6, pady=6, ipady=12)
+            return btn
+
+        tool_button(0, 0, "Upload JSONL Batches", BatchUploaderApp, "uploader")
+        tool_button(0, 1, "Manage & Download Batches", BatchManagerApp, "manager")
+        tool_button(1, 0, "Convert JSONL to TXT", JsonlToTxtApp, "converter")
+        tool_button(1, 1, "AI Text Refiner (Post-Process)", AiTextRefinerApp, "refiner")
+
+        settings_tab.columnconfigure(0, weight=1)
+        settings_frame = ttk.LabelFrame(settings_tab, text="Settings", padding=8)
+        settings_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        settings_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(settings_frame, text="OpenAI API Key").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.api_key_var = StringVar(value=self.settings.api_key)
+        api_entry = ttk.Entry(
+            settings_frame, textvariable=self.api_key_var, show="*", width=60
+        )
+        api_entry.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        ttk.Label(settings_frame, text="OCR Prompt (English)").grid(
+            row=2, column=0, sticky="w"
+        )
+        self.ocr_en_text = ScrolledText(settings_frame, height=4, width=60)
+        self.ocr_en_text.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.ocr_en_text.insert("1.0", self.settings.ocr_prompt_en)
+
+        ttk.Label(settings_frame, text="OCR Prompt (German)").grid(
+            row=4, column=0, sticky="w"
+        )
+        self.ocr_de_text = ScrolledText(settings_frame, height=4, width=60)
+        self.ocr_de_text.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        self.ocr_de_text.insert("1.0", self.settings.ocr_prompt_de)
+
+        ttk.Label(settings_frame, text="TOC Prompt (English)").grid(
+            row=6, column=0, sticky="w"
+        )
+        self.toc_en_text = ScrolledText(settings_frame, height=4, width=60)
+        self.toc_en_text.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        self.toc_en_text.insert("1.0", self.settings.toc_prompt_en)
+
+        ttk.Label(settings_frame, text="TOC Prompt (German)").grid(
+            row=8, column=0, sticky="w"
+        )
+        self.toc_de_text = ScrolledText(settings_frame, height=4, width=60)
+        self.toc_de_text.grid(row=9, column=0, sticky="ew", pady=(0, 10))
+        self.toc_de_text.insert("1.0", self.settings.toc_prompt_de)
+
+        self.keep_pdf_var = BooleanVar(value=self.settings.keep_pdf_images)
+        self.keep_toc_var = BooleanVar(value=self.settings.keep_toc_images)
+        ttk.Checkbutton(
+            settings_frame,
+            text="Keep PDF images after OCR",
+            variable=self.keep_pdf_var,
+        ).grid(row=10, column=0, sticky="w")
+        ttk.Checkbutton(
+            settings_frame,
+            text="Keep TOC images after OCR",
+            variable=self.keep_toc_var,
+        ).grid(row=11, column=0, sticky="w")
+
+        ttk.Button(
+            settings_frame, text="Save Settings", command=self._save_settings_from_ui
+        ).grid(row=12, column=0, sticky="e", pady=(8, 0))
+
+        log_frame = ttk.Labelframe(settings_tab, text="Logs", padding=8)
+        log_frame.grid(row=1, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.columnconfigure(1, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        frame.rowconfigure(6, weight=1)
+        settings_tab.rowconfigure(1, weight=1)
 
         self.log = ScrolledText(log_frame, height=18)
         self.log.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
@@ -957,12 +1089,7 @@ class EpubBuilderApp:
             log_frame, text="Open OCR progress text", command=self.open_progress_text
         ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        version_label = ttk.Label(
-            frame, text=f"Version {APP_VERSION}", foreground="#666666"
-        )
-        version_label.grid(row=7, column=0, columnspan=2, sticky="e", pady=(6, 0))
-
-        self._log(f"Input folder: {self.paths['input']}")
+        self._log(f"Project folder: {self.project_root}")
         self._log(f"Output folder: {self.paths['output']}")
         self._log(f"Log file: {self.log_file}")
 
@@ -979,134 +1106,57 @@ class EpubBuilderApp:
         self.root.config(menu=menu_bar)
 
     def open_settings_dialog(self) -> None:
-        dialog = Toplevel(self.root)
-        dialog.title("Settings")
-        dialog.resizable(False, False)
+        if hasattr(self, "notebook"):
+            self.notebook.select(2)
+            self.root.focus_force()
 
-        frame = ttk.Frame(dialog, padding=12)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-
-        ttk.Label(frame, text="OpenAI API Key").grid(row=0, column=0, sticky="w")
-        api_entry = ttk.Entry(frame, width=60)
-        api_entry.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        api_entry.insert(0, self.settings.api_key)
-
-        ttk.Label(frame, text="OCR Prompt (English)").grid(row=2, column=0, sticky="w")
-        ocr_en = ScrolledText(frame, height=4, width=60)
-        ocr_en.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        ocr_en.insert("1.0", self.settings.ocr_prompt_en)
-
-        ttk.Label(frame, text="OCR Prompt (German)").grid(row=4, column=0, sticky="w")
-        ocr_de = ScrolledText(frame, height=4, width=60)
-        ocr_de.grid(row=5, column=0, sticky="ew", pady=(0, 10))
-        ocr_de.insert("1.0", self.settings.ocr_prompt_de)
-
-        ttk.Label(frame, text="TOC Prompt (English)").grid(row=6, column=0, sticky="w")
-        toc_en = ScrolledText(frame, height=4, width=60)
-        toc_en.grid(row=7, column=0, sticky="ew", pady=(0, 10))
-        toc_en.insert("1.0", self.settings.toc_prompt_en)
-
-        ttk.Label(frame, text="TOC Prompt (German)").grid(row=8, column=0, sticky="w")
-        toc_de = ScrolledText(frame, height=4, width=60)
-        toc_de.grid(row=9, column=0, sticky="ew", pady=(0, 10))
-        toc_de.insert("1.0", self.settings.toc_prompt_de)
-
-        ttk.Label(frame, text="Output folder").grid(row=10, column=0, sticky="w")
-        output_dir_frame = ttk.Frame(frame)
-        output_dir_frame.grid(row=11, column=0, sticky="ew", pady=(0, 10))
-        output_dir_frame.columnconfigure(0, weight=1)
-        output_dir_entry = ttk.Entry(output_dir_frame, width=60)
-        output_dir_entry.grid(row=0, column=0, sticky="ew")
-        output_dir_entry.insert(0, self.settings.output_dir)
-
-        def choose_output_dir() -> None:
-            path = filedialog.askdirectory(title="Select output folder")
-            if path:
-                output_dir_entry.delete(0, "end")
-                output_dir_entry.insert(0, path)
-
-        ttk.Button(output_dir_frame, text="Browse", command=choose_output_dir).grid(
-            row=0, column=1, padx=(6, 0)
+    def _save_settings_from_ui(self) -> None:
+        self.settings = AppSettings(
+            api_key=self.api_key_var.get().strip(),
+            ocr_prompt_en=self.ocr_en_text.get("1.0", "end").strip(),
+            ocr_prompt_de=self.ocr_de_text.get("1.0", "end").strip(),
+            toc_prompt_en=self.toc_en_text.get("1.0", "end").strip(),
+            toc_prompt_de=self.toc_de_text.get("1.0", "end").strip(),
+            keep_pdf_images=self.keep_pdf_var.get(),
+            keep_toc_images=self.keep_toc_var.get(),
         )
+        save_settings(self.settings)
+        self._log("Settings saved.")
 
-        ttk.Label(frame, text="PDF image folder").grid(row=12, column=0, sticky="w")
-        pdf_dir_frame = ttk.Frame(frame)
-        pdf_dir_frame.grid(row=13, column=0, sticky="ew", pady=(0, 10))
-        pdf_dir_frame.columnconfigure(0, weight=1)
-        pdf_dir_entry = ttk.Entry(pdf_dir_frame, width=60)
-        pdf_dir_entry.grid(row=0, column=0, sticky="ew")
-        pdf_dir_entry.insert(0, self.settings.pdf_images_dir)
+    def _set_project_root(self, path: Path) -> None:
+        if path.is_file():
+            project_root = path.parent
+        else:
+            project_root = path
+        if project_root == self.project_root:
+            return
+        self.project_root = project_root
+        self.paths = ensure_project_dirs(self.project_root)
+        self.log_file = self.paths["logs"] / "bulk_ocr.log"
+        self.progress_text_file = ocr_progress_text_path(self.paths["logs"])
+        self._log(f"Project folder set to: {self.project_root}")
 
-        def choose_pdf_dir() -> None:
-            path = filedialog.askdirectory(title="Select PDF image folder")
-            if path:
-                pdf_dir_entry.delete(0, "end")
-                pdf_dir_entry.insert(0, path)
+    def _launch_addon_window(self, AppClass, title_prefix="Tool"):
+        try:
+            if AppClass is None:
+                raise RuntimeError("Addon is not available in this build.")
+            top = Toplevel(self.root)
+            app = AppClass(top)
+            if hasattr(app, "api_key_var") and self.settings.api_key:
+                if self.settings.api_key != "REPLACE_WITH_YOUR_API_KEY":
+                    app.api_key_var.set(self.settings.api_key)
+            top.focus_force()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not launch {title_prefix}:\n{e}")
 
-        ttk.Button(pdf_dir_frame, text="Browse", command=choose_pdf_dir).grid(
-            row=0, column=1, padx=(6, 0)
-        )
-
-        ttk.Label(frame, text="TOC image folder").grid(row=14, column=0, sticky="w")
-        toc_dir_frame = ttk.Frame(frame)
-        toc_dir_frame.grid(row=15, column=0, sticky="ew", pady=(0, 10))
-        toc_dir_frame.columnconfigure(0, weight=1)
-        toc_dir_entry = ttk.Entry(toc_dir_frame, width=60)
-        toc_dir_entry.grid(row=0, column=0, sticky="ew")
-        toc_dir_entry.insert(0, self.settings.toc_images_dir)
-
-        def choose_toc_dir() -> None:
-            path = filedialog.askdirectory(title="Select TOC image folder")
-            if path:
-                toc_dir_entry.delete(0, "end")
-                toc_dir_entry.insert(0, path)
-
-        ttk.Button(toc_dir_frame, text="Browse", command=choose_toc_dir).grid(
-            row=0, column=1, padx=(6, 0)
-        )
-
-        keep_pdf_var = BooleanVar(value=self.settings.keep_pdf_images)
-        keep_toc_var = BooleanVar(value=self.settings.keep_toc_images)
-        ttk.Checkbutton(
-            frame,
-            text="Keep PDF images after OCR",
-            variable=keep_pdf_var,
-        ).grid(row=16, column=0, sticky="w")
-        ttk.Checkbutton(
-            frame,
-            text="Keep TOC images after OCR",
-            variable=keep_toc_var,
-        ).grid(row=17, column=0, sticky="w")
-
-        button_frame = ttk.Frame(frame)
-        button_frame.grid(row=18, column=0, sticky="e", pady=(10, 0))
-
-        def save_and_close() -> None:
-            self.settings = AppSettings(
-                api_key=api_entry.get().strip(),
-                ocr_prompt_en=ocr_en.get("1.0", "end").strip(),
-                ocr_prompt_de=ocr_de.get("1.0", "end").strip(),
-                toc_prompt_en=toc_en.get("1.0", "end").strip(),
-                toc_prompt_de=toc_de.get("1.0", "end").strip(),
-                output_dir=output_dir_entry.get().strip(),
-                pdf_images_dir=pdf_dir_entry.get().strip(),
-                toc_images_dir=toc_dir_entry.get().strip(),
-                keep_pdf_images=keep_pdf_var.get(),
-                keep_toc_images=keep_toc_var.get(),
-            )
-            save_settings(self.settings)
-            self.paths = ensure_dirs(self.settings)
-            self.log_file = self.paths["logs"] / "bulk_ocr.log"
-            self._log("Settings saved.")
-            dialog.destroy()
-
-        ttk.Button(button_frame, text="Save", command=save_and_close).grid(
-            row=0, column=0, padx=(0, 8)
-        )
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).grid(
-            row=0, column=1
-        )
+    def _format_eta(self, seconds: float) -> str:
+        if seconds < 0 or math.isinf(seconds):
+            return "ETA: --"
+        seconds = int(seconds)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"ETA: {hours:02d}:{minutes:02d}:{secs:02d}"
 
     def _log(self, message: str) -> None:
         entry = f"[{timestamp()}] {message}"
@@ -1121,12 +1171,19 @@ class EpubBuilderApp:
 
     def _update_progress(self, current: int, total: int) -> None:
         percent = int((current / total) * 100) if total else 0
+        eta_text = "ETA: --"
+        if self.start_time and current > 0 and total > 0:
+            elapsed = time.time() - self.start_time
+            time_per_page = elapsed / current
+            remaining = total - current
+            eta_text = self._format_eta(time_per_page * remaining)
 
         def apply() -> None:
             self.progress_var.set(percent)
             self.progress_label_var.set(
                 f"OCR progress: {percent}% ({current}/{total})"
             )
+            self.eta_label_var.set(eta_text)
 
         self.root.after(0, apply)
 
@@ -1208,6 +1265,7 @@ class EpubBuilderApp:
         )
         if path:
             self.pdf_path = Path(path)
+            self._set_project_root(self.pdf_path)
             self._log(f"Selected PDF: {self.pdf_path.name}")
             if self.skip_toc_var.get():
                 self._log("Skip TOC enabled. Not selecting TOC pages.")
@@ -1221,6 +1279,7 @@ class EpubBuilderApp:
         )
         if path:
             self.txt_path = Path(path)
+            self._set_project_root(self.txt_path)
             self._log(f"Selected text file: {self.txt_path.name}")
 
     def select_batch_results(self) -> None:
@@ -1230,6 +1289,8 @@ class EpubBuilderApp:
         )
         if paths:
             self.batch_result_paths = [Path(path) for path in paths]
+            if self.batch_result_paths:
+                self._set_project_root(self.batch_result_paths[0])
             names = ", ".join(path.name for path in self.batch_result_paths)
             self._log(f"Selected batch result files: {names}")
 
@@ -1238,6 +1299,7 @@ class EpubBuilderApp:
         if path:
             folder = Path(path)
             self.image_folder = folder
+            self._set_project_root(folder)
             images = collect_image_files(folder)
             if not images:
                 messagebox.showwarning(
@@ -1264,6 +1326,7 @@ class EpubBuilderApp:
             title="Save Batch JSONL",
             defaultextension=".jsonl",
             filetypes=[("JSONL files", "*.jsonl")],
+            initialdir=self.paths["jsonl"],
         )
         if not save_path:
             return
@@ -1440,6 +1503,9 @@ class EpubBuilderApp:
         self.is_running = True
         if self.pause_button:
             self.pause_button.configure(state="normal")
+        self._save_settings_from_ui()
+        self.start_time = time.time()
+        self.eta_label_var.set("ETA: --")
         self._update_progress(0, 1)
         try:
             client = build_openai_client(self.settings.api_key)
@@ -1532,11 +1598,18 @@ class EpubBuilderApp:
                     )
                     return
 
-            output_name = f"epub_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.epub"
-            output_path = self.paths["output"] / output_name
-            create_epub("Generated Book", chapters, output_path, language)
-            self._log(f"EPUB created: {output_path.name}")
-            messagebox.showinfo("Done", f"EPUB created: {output_path.name}")
+            if self.skip_epub_var.get():
+                output_name = f"output_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                output_path = self.paths["output"] / output_name
+                output_path.write_text(build_markdown(chapters), encoding="utf-8")
+                self._log(f"Text output created: {output_path.name}")
+                messagebox.showinfo("Done", f"Text output created: {output_path.name}")
+            else:
+                output_name = f"epub_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.epub"
+                output_path = self.paths["output"] / output_name
+                create_epub("Generated Book", chapters, output_path, language)
+                self._log(f"EPUB created: {output_path.name}")
+                messagebox.showinfo("Done", f"EPUB created: {output_path.name}")
             self._update_progress(1, 1)
         except Exception as exc:
             self._log(f"Error: {exc}")
@@ -1546,6 +1619,8 @@ class EpubBuilderApp:
             self.pause_event.clear()
             if self.pause_button:
                 self.pause_button.configure(text="Pause", state="disabled")
+            self.start_time = None
+            self.eta_label_var.set("ETA: --")
 
     def _process_pdf(self, client: OpenAI) -> tuple[str, str]:
         pdfimgs_dir = self.paths["pdfimgs"]
@@ -1557,7 +1632,7 @@ class EpubBuilderApp:
         )
         if not images:
             raise ValueError("No images extracted from PDF.")
-        state = load_ocr_state()
+        state = load_ocr_state(self.paths["logs"])
         use_state = False
         if state and self.pdf_path:
             if (
@@ -1572,7 +1647,7 @@ class EpubBuilderApp:
                 if resume:
                     use_state = True
                 else:
-                    clear_ocr_state()
+                    clear_ocr_state(self.paths["logs"])
         if use_state and state:
             language = state.language
             text_chunks = list(state.text_chunks)
@@ -1594,7 +1669,7 @@ class EpubBuilderApp:
             self._log(f"Detected language: {language}")
             text_chunks = []
             start_index = 0
-            clear_ocr_state()
+            clear_ocr_state(self.paths["logs"])
             self._write_progress_text([])
 
         self._log("Starting OCR on PDF images")
@@ -1622,11 +1697,11 @@ class EpubBuilderApp:
                 text_chunks=text_chunks,
                 created_at=timestamp(),
             )
-            save_ocr_state(state)
+            save_ocr_state(state, self.paths["logs"])
             self._write_progress_text(text_chunks)
             self._update_progress(idx + 1, total)
 
-        clear_ocr_state()
+        clear_ocr_state(self.paths["logs"])
         full_text = "\n".join(text_chunks).strip()
         if not self.settings.keep_pdf_images:
             for image_path in images:
