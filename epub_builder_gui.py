@@ -437,7 +437,10 @@ def ocr_images_with_retry(
                     )
                     break
                 log("OCR failed permanently for this batch. Inserting placeholder.")
-                return "\n\n[[!! ERROR: OCR FAILED FOR THIS SECTION (Check Image) !!]]\n\n"
+                outputs.append(
+                    "\n\n[[!! ERROR: OCR FAILED FOR THIS SECTION (Check Image) !!]]\n\n"
+                )
+                break
     return "\n".join(outputs)
 
 
