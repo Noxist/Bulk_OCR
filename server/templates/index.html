@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bulk OCR – Web</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .drop-active { border-color: #60a5fa !important; background: rgba(96,165,250,0.07); }
+    .log-info  { color: #d1fae5; }
+    .log-warn  { color: #fde68a; }
+    .log-error { color: #fca5a5; }
+    #log-output::-webkit-scrollbar { width: 6px; }
+    #log-output::-webkit-scrollbar-track { background: #1f2937; }
+    #log-output::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen font-sans">
+
+  <div class="max-w-2xl mx-auto py-10 px-4">
+
+    <!-- Header -->
+    <div class="mb-8">
+      <h1 class="text-3xl font-bold tracking-tight">📖 Bulk OCR</h1>
+      <p class="text-gray-400 mt-1">PDF hochladen → OCR via OpenAI → EPUB / TXT / HTML exportieren</p>
+    </div>
+
+    <!-- Upload + Optionen -->
+    <div id="upload-section" class="bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-5">
+
+      <!-- Drop-Zone -->
+      <div id="drop-zone"
+           class="border-2 border-dashed border-gray-700 rounded-xl p-10 text-center cursor-pointer transition-all mb-5 hover:border-gray-500"
+           onclick="document.getElementById('file-input').click()">
+        <div class="text-5xl mb-3 select-none">📄</div>
+        <p class="text-gray-300 font-medium">PDF hier ablegen oder klicken</p>
+        <p id="filename-display" class="text-blue-400 text-sm mt-2 min-h-5"></p>
+        <input type="file" id="file-input" accept=".pdf" class="hidden" />
+      </div>
+
+      <!-- Optionen -->
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">Ausgabeformat</label>
+          <select id="output-format"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-500">
+            <option value="epub">EPUB</option>
+            <option value="txt">TXT / Markdown</option>
+            <option value="html">HTML</option>
+          </select>
+        </div>
+        <div id="toc-pages-wrapper">
+          <label class="block text-sm text-gray-400 mb-1">TOC-Seiten <span class="text-gray-600">(z.B. 3, 4)</span></label>
+          <input type="text" id="toc-pages"
+                 placeholder="Leer = kein TOC"
+                 class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500" />
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3 mb-5">
+        <input type="checkbox" id="skip-toc" checked
+               class="w-4 h-4 rounded accent-blue-500 cursor-pointer" />
+        <label for="skip-toc" class="text-sm text-gray-300 cursor-pointer select-none">
+          Kein Inhaltsverzeichnis – ganzes Dokument als ein Kapitel
+        </label>
+      </div>
+
+      <button id="start-btn" disabled
+              class="w-full bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition-colors text-sm">
+        OCR starten
+      </button>
+    </div>
+
+    <!-- Fortschritt -->
+    <div id="progress-section" class="hidden bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-5">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold text-gray-200">Fortschritt</h2>
+        <span id="progress-label" class="text-sm text-gray-400">0%</span>
+      </div>
+      <div class="w-full bg-gray-800 rounded-full h-2 mb-4 overflow-hidden">
+        <div id="progress-bar"
+             class="bg-blue-500 h-2 rounded-full transition-all duration-300"
+             style="width: 0%"></div>
+      </div>
+      <div id="log-output"
+           class="bg-gray-950 border border-gray-800 rounded-lg p-3 h-60 overflow-y-auto font-mono text-xs space-y-0.5">
+      </div>
+    </div>
+
+    <!-- Fertig -->
+    <div id="done-section" class="hidden bg-gray-900 border border-green-800 rounded-2xl p-6 mb-5">
+      <h2 class="font-semibold text-green-400 mb-1">✅ Fertig!</h2>
+      <p id="done-filename" class="text-sm text-gray-400 mb-4 font-mono"></p>
+      <div class="flex gap-3">
+        <a id="download-btn" href="#"
+           class="inline-block bg-green-700 hover:bg-green-600 text-white font-semibold px-5 py-2 rounded-lg transition-colors text-sm">
+          ⬇ Herunterladen
+        </a>
+        <button onclick="resetUI()"
+                class="inline-block bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold px-5 py-2 rounded-lg transition-colors text-sm">
+          Neuer Job
+        </button>
+      </div>
+    </div>
+
+    <!-- Fehler -->
+    <div id="error-section" class="hidden bg-gray-900 border border-red-800 rounded-2xl p-6 mb-5">
+      <h2 class="font-semibold text-red-400 mb-1">❌ Fehler</h2>
+      <p id="error-msg" class="text-sm text-gray-300 font-mono whitespace-pre-wrap"></p>
+      <button onclick="resetUI()" class="mt-4 bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold px-4 py-2 rounded-lg text-sm transition-colors">
+        Nochmal versuchen
+      </button>
+    </div>
+
+  </div><!-- /container -->
+
+<script>
+  // ── State ──────────────────────────────────────────────────────
+  let selectedFile = null;
+  let currentJobId  = null;
+  let eventSource   = null;
+
+  // ── DOM refs ───────────────────────────────────────────────────
+  const dropZone        = document.getElementById('drop-zone');
+  const fileInput       = document.getElementById('file-input');
+  const filenameDisplay = document.getElementById('filename-display');
+  const startBtn        = document.getElementById('start-btn');
+  const skipTocCb       = document.getElementById('skip-toc');
+  const tocPagesWrapper = document.getElementById('toc-pages-wrapper');
+
+  // ── File selection ─────────────────────────────────────────────
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) selectFile(fileInput.files[0]);
+  });
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drop-active'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drop-active'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drop-active');
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.toLowerCase().endsWith('.pdf')) selectFile(f);
+    else showError('Nur PDF-Dateien werden akzeptiert.');
+  });
+
+  function selectFile(f) {
+    selectedFile = f;
+    const mb = (f.size / 1024 / 1024).toFixed(1);
+    filenameDisplay.textContent = `${f.name} (${mb} MB)`;
+    startBtn.disabled = false;
+  }
+
+  // TOC-Seiten-Feld ein-/ausblenden
+  skipTocCb.addEventListener('change', () => {
+    tocPagesWrapper.style.opacity = skipTocCb.checked ? '0.4' : '1';
+    document.getElementById('toc-pages').disabled = skipTocCb.checked;
+  });
+  tocPagesWrapper.style.opacity = '0.4';
+  document.getElementById('toc-pages').disabled = true;
+
+  // ── Start ──────────────────────────────────────────────────────
+  startBtn.addEventListener('click', startJob);
+
+  async function startJob() {
+    if (!selectedFile) return;
+
+    startBtn.disabled = true;
+    show('progress-section');
+    hide('done-section');
+    hide('error-section');
+    clearLog();
+    setProgress(0, 'Job wird gestartet…');
+
+    const fd = new FormData();
+    fd.append('file', selectedFile);
+    fd.append('output_format', document.getElementById('output-format').value);
+    fd.append('skip_toc', skipTocCb.checked ? 'true' : 'false');
+    fd.append('toc_pages', document.getElementById('toc-pages').value);
+
+    let res;
+    try {
+      res = await fetch('/api/jobs', { method: 'POST', body: fd });
+    } catch (e) {
+      showError(`Netzwerkfehler: ${e}`);
+      return;
+    }
+
+    const data = await res.json();
+    if (data.error) { showError(data.error); return; }
+
+    currentJobId = data.job_id;
+    listenToJob(currentJobId);
+  }
+
+  // ── SSE Stream ─────────────────────────────────────────────────
+  function listenToJob(jobId) {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource(`/api/jobs/${jobId}/stream`);
+
+    eventSource.onmessage = e => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+
+      if (ev.type === 'log') {
+        appendLog(ev.ts ? `[${ev.ts}] ${ev.msg}` : ev.msg, ev.level);
+      } else if (ev.type === 'progress') {
+        setProgress(ev.pct, ev.label);
+      } else if (ev.type === 'done') {
+        eventSource.close();
+        setProgress(100, 'Fertig!');
+        appendLog('✅ Job abgeschlossen.', 'INFO');
+        showDone(ev.filename, jobId);
+      } else if (ev.type === 'error') {
+        eventSource.close();
+        showError(ev.msg);
+      }
+    };
+
+    eventSource.onerror = () => {
+      appendLog('⚠️ Verbindung unterbrochen – prüfe Status…', 'WARN');
+      eventSource.close();
+      // Polling-Fallback
+      setTimeout(() => pollStatus(jobId), 3000);
+    };
+  }
+
+  async function pollStatus(jobId) {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/status`);
+      const d = await r.json();
+      if (d.status === 'done') {
+        setProgress(100, 'Fertig!');
+        showDone(d.output_filename, jobId);
+      } else if (d.status === 'error') {
+        showError('Job fehlgeschlagen. Bitte Log prüfen.');
+      } else {
+        setTimeout(() => pollStatus(jobId), 3000);
+      }
+    } catch { setTimeout(() => pollStatus(jobId), 5000); }
+  }
+
+  // ── UI Helpers ─────────────────────────────────────────────────
+  function show(id) { document.getElementById(id).classList.remove('hidden'); }
+  function hide(id) { document.getElementById(id).classList.add('hidden'); }
+
+  function setProgress(pct, label) {
+    document.getElementById('progress-bar').style.width = `${pct}%`;
+    document.getElementById('progress-label').textContent = label ? `${pct}% – ${label}` : `${pct}%`;
+  }
+
+  function appendLog(msg, level = 'INFO') {
+    const el = document.getElementById('log-output');
+    const line = document.createElement('div');
+    const cls = level === 'WARN' ? 'log-warn' : level === 'ERROR' ? 'log-error' : 'log-info';
+    line.className = cls;
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function clearLog() {
+    document.getElementById('log-output').innerHTML = '';
+  }
+
+  function showDone(filename, jobId) {
+    const btn = document.getElementById('download-btn');
+    btn.href = `/api/jobs/${jobId}/download`;
+    btn.download = filename || 'output';
+    document.getElementById('done-filename').textContent = filename || '';
+    show('done-section');
+  }
+
+  function showError(msg) {
+    document.getElementById('error-msg').textContent = msg;
+    show('error-section');
+    hide('progress-section');
+    startBtn.disabled = !selectedFile;
+  }
+
+  function resetUI() {
+    selectedFile = null;
+    currentJobId = null;
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    fileInput.value = '';
+    filenameDisplay.textContent = '';
+    startBtn.disabled = true;
+    hide('progress-section');
+    hide('done-section');
+    hide('error-section');
+    setProgress(0, '');
+    clearLog();
+  }
+</script>
+</body>
+</html>

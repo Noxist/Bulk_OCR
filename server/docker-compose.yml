@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+
+  app:
+    build:
+      context: ..          # repository root, so config.py is reachable
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    env_file: .env          # must contain OPENAI_API_KEY=sk-...
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./jobs:/app/server/jobs   # persist output files across restarts
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app

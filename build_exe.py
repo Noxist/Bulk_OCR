@@ -1,20 +1,23 @@
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_FILE = BASE_DIR / "epub_builder_gui.py"
 ICON_DIR = BASE_DIR / "assets" / "icons"
+
+# Import version from the shared config module
+sys_path = str(BASE_DIR)
+if sys_path not in __import__("sys").path:
+    __import__("sys").path.insert(0, sys_path)
+from config import APP_VERSION  # noqa: E402
 
 
 def get_version() -> str:
-    content = APP_FILE.read_text(encoding="utf-8")
-    match = re.search(r'APP_VERSION\\s*=\\s*"([^"]+)"', content)
-    if match:
-        return match.group(1)
-    return "0.0.0"
+    return APP_VERSION
 
 
 def resolve_icon() -> Path | None:
@@ -47,11 +50,23 @@ def build_exe() -> None:
         "addons.ai_text_refiner",
     ]
     command = [
-        "pyinstaller",
+        sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--noconsole",
         "--name",
         exe_name,
+        "--add-data",
+        f"assets{os.pathsep}assets",
+        "--add-data",
+        f"config.py{os.pathsep}.",
+        "--collect-all",
+        "fitz",
+        "--collect-all",
+        "ebooklib",
+        "--collect-all",
+        "sv_ttk",
+        "--collect-all",
+        "tkinterdnd2",
         "main.py",
     ]
     command.extend(hidden_imports)

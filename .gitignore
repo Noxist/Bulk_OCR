@@ -1,0 +1,35 @@
+# Secrets (API keys) – NEVER commit
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# App temp/output dirs
+_images/
+_logs/
+_jsonl/
+_output/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# PyInstaller
+Output/
+
+# Server runtime
+server/.env
+server/jobs/
+
+# Local test files
+Test File/
